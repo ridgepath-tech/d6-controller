@@ -145,11 +145,11 @@ Dropping onto a configured key opens an in-app confirmation before replacing it.
 ### Codex page
 
 The public starter profile includes an internal `Codex` page rather than a
-website redirect. It provides the common deck controls (Home, Back, Previous,
-Next, Page Indicator, and Sleep). The installed Codex desktop executable is
-machine-specific, so an optional Open Codex launch action should be configured
-locally after verifying the installed application path. No undocumented voice,
-accept/reject, or agent shortcut is hardcoded.
+website redirect. It starts with only a themed Home action on Key 1. The
+installed Codex desktop executable is machine-specific, so an optional Open
+Codex launch action should be configured locally after verifying the installed
+application path. No undocumented voice, accept/reject, or agent shortcut is
+hardcoded.
 
 ### Settings and backups
 
