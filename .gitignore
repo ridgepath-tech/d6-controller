@@ -19,6 +19,8 @@ profiles/assets/*
 !profiles/assets/next.png
 !profiles/assets/sleep.png
 !profiles/assets/gas-cloud.png
+!profiles/assets/mic.png
+!profiles/assets/mic-muted.png
 !profiles/assets/.gitkeep
 creds.txt
 

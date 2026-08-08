@@ -135,6 +135,9 @@ folder artwork and draw the label over it. Apply the selected page to send the
 full layout to the deck. LCD labels use a multiline editor and preserve
 explicit line breaks.
 
+The built-in microphone mute action uses bundled blue and red neon artwork and
+does not add a default LCD label.
+
 Configured keys can be dragged onto another key in the visual deck layout to
 move the complete setting, including its action, label, font size, and artwork.
 Dropping onto a configured key opens an in-app confirmation before replacing it.

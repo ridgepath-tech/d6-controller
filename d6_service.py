@@ -662,6 +662,13 @@ def render_labeled_custom_image(source: Path, destination: Path, label: str, fon
     return destination
 
 
+def microphone_artwork_path(profile_dir: Path, muted: bool) -> Path | None:
+    """Return the polished state artwork when it is installed with the profile."""
+
+    candidate = profile_dir / "assets" / ("mic-muted.png" if muted else "mic.png")
+    return candidate if candidate.is_file() else None
+
+
 def _com_call(interface: ctypes.c_void_p, index: int, restype: Any, argtypes: list[Any], *args: Any) -> Any:
     vtable = ctypes.cast(interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
     function = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtable[index])
@@ -1266,7 +1273,8 @@ class D6Service:
                     elif action and action_type in RENDERED_ACTION_TYPES and not definition.get("image"):
                         if action_type == "mic_mute" and microphone_muted is None:
                             microphone_muted = get_microphone_mute()
-                        image_path = render_action_image(
+                        mic_artwork = microphone_artwork_path(self.profile_dir, bool(microphone_muted)) if action_type == "mic_mute" else None
+                        image_path = mic_artwork or render_action_image(
                             _action_image_path(
                                 self.profile_dir,
                                 profile_name or "profile",
@@ -1615,16 +1623,18 @@ class D6RequestHandler(BaseHTTPRequestHandler):
         elif definition.get("image"):
             raise FileNotFoundError
         else:
-            image_path = render_action_image(
+            muted = get_microphone_mute() if action_type == "mic_mute" else False
+            mic_artwork = microphone_artwork_path(self.profile_dir, muted) if action_type == "mic_mute" else None
+            image_path = mic_artwork or render_action_image(
                 _action_image_path(self.profile_dir, name, selected_scene, selected_page, int(key), action, page_index=page_index, page_total=len(pages)),
                 label,
                 action_font_size(action),
                 action_type,
-                muted=get_microphone_mute() if action_type == "mic_mute" else False,
+                muted=muted,
             )
         body = image_path.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Type", mimetypes.guess_type(image_path.name)[0] or "application/octet-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

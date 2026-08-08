@@ -19,6 +19,7 @@ from d6_service import (
     key_definitions,
     load_profile,
     launch_target,
+    microphone_artwork_path,
     normalize_profile,
     render_action_image,
     render_labeled_custom_image,
@@ -99,6 +100,15 @@ class D6ServiceHelpersTests(unittest.TestCase):
                 self.assertEqual(image.size, (100, 100))
                 background = image.getpixel((0, 0))
                 self.assertLess(sum(abs(left - right) for left, right in zip(image.getpixel((50, 17)), background)), 30)
+
+    def test_microphone_artwork_path_selects_each_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            assets = Path(temporary) / "assets"
+            assets.mkdir()
+            (assets / "mic.png").write_bytes(b"blue")
+            (assets / "mic-muted.png").write_bytes(b"red")
+            self.assertEqual(microphone_artwork_path(Path(temporary), False), assets / "mic.png")
+            self.assertEqual(microphone_artwork_path(Path(temporary), True), assets / "mic-muted.png")
 
     def test_structure_and_page_resolution(self) -> None:
         profile = {"scenes": {"default": {"pages": {"main": {"keys": {"1": {"action": "hotkey"}}}}}}}
