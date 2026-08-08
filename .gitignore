@@ -13,6 +13,7 @@ data/
 profiles/*.json
 !profiles/.gitkeep
 profiles/assets/*
+!profiles/assets/codex.png
 !profiles/assets/.gitkeep
 creds.txt
 

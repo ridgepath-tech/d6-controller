@@ -15,7 +15,8 @@
                 "scene": "default",
                 "page": "Codex",
                 "label": "Codex"
-              }
+              },
+              "image": "assets\\codex.png"
             }
           }
         },
