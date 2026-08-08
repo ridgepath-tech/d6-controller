@@ -14,6 +14,10 @@ profiles/*.json
 !profiles/.gitkeep
 profiles/assets/*
 !profiles/assets/codex.png
+!profiles/assets/home.png
+!profiles/assets/previous.png
+!profiles/assets/next.png
+!profiles/assets/sleep.png
 !profiles/assets/.gitkeep
 creds.txt
 
