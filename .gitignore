@@ -18,6 +18,7 @@ profiles/assets/*
 !profiles/assets/previous.png
 !profiles/assets/next.png
 !profiles/assets/sleep.png
+!profiles/assets/gas-cloud.png
 !profiles/assets/.gitkeep
 creds.txt
 
