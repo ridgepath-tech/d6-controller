@@ -24,7 +24,7 @@
 html, #root { height: 100%; }
 html, body { overflow: hidden; }
 body { margin: 0; min-width: 320px; min-height: 100%; background: var(--bg); }
-button, select, input { font: inherit; }
+button, select, input, textarea { font: inherit; }
 button { color: inherit; }
 .app-shell { height: 100dvh; min-height: 0; overflow: hidden; background: var(--bg); }
 .topbar { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-bottom: 1px solid var(--line); background: #11161b; }
@@ -123,8 +123,9 @@ input[type="range"] { width: 100%; height: 5px; margin-top: 8px; accent-color: v
 .modal-heading { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; margin-bottom: 20px; }
 .modal-heading h2 { margin: 4px 0 0; font-size: 18px; }
 .modal-field { display: grid; gap: 7px; margin-top: 14px; color: #dce3e9; font-size: 12px; font-weight: 650; }
-.modal-field input, .modal-field select { width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; color: var(--text); background: var(--surface); }
-.modal-field input:focus, .modal-field select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px #6ea8ff24; }
+.modal-field input, .modal-field select, .modal-field textarea { width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; color: var(--text); background: var(--surface); }
+.modal-field textarea { min-height: 64px; resize: vertical; line-height: 1.3; }
+.modal-field input:focus, .modal-field select:focus, .modal-field textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px #6ea8ff24; }
 .modal-two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .modal-hint { margin: 14px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .modal-error { margin: 14px 0 0; padding: 9px 10px; border: 1px solid #7d3d45; border-radius: 6px; color: #ffb5bd; background: #351a20; font-size: 11px; }

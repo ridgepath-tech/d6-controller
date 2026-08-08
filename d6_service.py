@@ -480,12 +480,16 @@ def _fit_font(draw: Any, font_path: Path | None, text: str, requested_size: int,
     left, top, right, bottom = box
     for size in range(max(8, min(28, int(requested_size))), 7, -1):
         font = ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
-        lines = textwrap.wrap(text, width=max(5, int((right - left) / max(size * 0.58, 1))), break_long_words=True) or ["Action"]
+        width = max(5, int((right - left) / max(size * 0.58, 1)))
+        lines: list[str] = []
+        for paragraph in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            lines.extend(textwrap.wrap(paragraph, width=width, break_long_words=True, break_on_hyphens=False) or [""])
+        lines = lines or ["Action"]
         widths = [draw.textbbox((0, 0), line, font=font)[2] for line in lines]
         height = sum(draw.textbbox((0, 0), line, font=font)[3] for line in lines) + max(0, len(lines) - 1) * 2
         if max(widths, default=0) <= right - left and height <= bottom - top:
             return font, lines
-    return (ImageFont.truetype(str(font_path), 8) if font_path else ImageFont.load_default()), [text[:18]]
+    return (ImageFont.truetype(str(font_path), 8) if font_path else ImageFont.load_default()), [line[:18] for line in str(text).splitlines() or ["Action"]]
 
 
 def _draw_fitted_text(draw: Any, font: Any, lines: list[str], box: tuple[int, int, int, int], fill: tuple[int, int, int]) -> None:
@@ -523,7 +527,7 @@ def render_action_image(path: Path, label: str, font_size: int = 16, action_type
         folder = [(13, 38), (13, 30), (35, 30), (41, 35), (86, 35), (86, 80), (13, 80)]
         draw.polygon(folder, fill=(11, 91, 119), outline=outline)
         draw.line((17, 47, 82, 47), fill=(99, 220, 205), width=2)
-        text_box = (19, 50, 80, 76)
+        text_box = (17, 49, 82, 79)
     else:
         icon_y = 45
         if action_type == "back":

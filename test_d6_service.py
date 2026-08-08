@@ -23,6 +23,7 @@ from d6_service import (
     resolve_page,
     select_folder_native,
     save_profile,
+    _fit_font,
 )
 
 
@@ -65,6 +66,14 @@ class D6ServiceHelpersTests(unittest.TestCase):
         self.assertEqual(action_label({"type": "back"}), "Back")
         self.assertEqual(action_label({"type": "page_indicator"}, page_index=1, page_total=3), "2/3")
         self.assertEqual(action_label({"type": "website", "label": "Docs"}), "Docs")
+        self.assertEqual(action_label({"type": "open_folder", "path": "D:\\Projects", "label": "Work\nProjects"}), "Work\nProjects")
+
+    def test_lcd_label_layout_preserves_explicit_line_breaks(self) -> None:
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGB", (100, 100))
+        _, lines = _fit_font(ImageDraw.Draw(image), None, "Work\nProjects", 16, (10, 10, 90, 90))
+        self.assertEqual(lines, ["Work", "Projects"])
 
     def test_structure_and_page_resolution(self) -> None:
         profile = {"scenes": {"default": {"pages": {"main": {"keys": {"1": {"action": "hotkey"}}}}}}}

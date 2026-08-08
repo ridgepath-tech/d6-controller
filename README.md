@@ -131,7 +131,9 @@ upload/replacement/reset, and Delete Action. Available actions include:
 
 Generated artwork is designed for the D6's 100×100 LCD and is replaced by
 custom artwork when supplied. Apply the selected page to send the full layout
-to the deck.
+to the deck. LCD labels use a multiline editor and preserve explicit line
+breaks; a labeled Open Folder action uses the generated folder artwork so its
+label remains visible.
 
 ### Codex page
 
