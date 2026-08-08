@@ -1,0 +1,19 @@
+{
+  "device": {
+    "vid": "3142",
+    "pid": "0007",
+    "brightness": 42
+  },
+  "scenes": {
+    "default": {
+      "pages": {
+        "main": {
+          "keys": {}
+        },
+        "Password Entry": {
+          "keys": {}
+        }
+      }
+    }
+  }
+}

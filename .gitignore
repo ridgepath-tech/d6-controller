@@ -1,0 +1,28 @@
+# Local Python/runtime output
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+
+# Frontend dependencies and generated bundle
+node_modules/
+dist/
+
+# User-specific controller state and artwork
+profiles/*.json
+!profiles/.gitkeep
+profiles/assets/*
+!profiles/assets/.gitkeep
+creds.txt
+
+# Investigation and local attachment material
+debug.log
+disassembly.txt
+tmp/
+.codex-remote-attachments/
+*.pdf
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+.vscode/
