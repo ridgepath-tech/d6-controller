@@ -10,7 +10,7 @@
         "main": {
           "keys": {
             "7": {
-              "action": { "type": "mic_mute", "label": "Mic" }
+              "action": { "type": "mic_mute" }
             },
             "11": {
               "action": {

@@ -20,6 +20,7 @@ from d6_service import (
     load_profile,
     launch_target,
     normalize_profile,
+    render_action_image,
     render_labeled_custom_image,
     resolve_page,
     select_folder_native,
@@ -87,6 +88,17 @@ class D6ServiceHelpersTests(unittest.TestCase):
             render_labeled_custom_image(source, destination, "Work\nProjects", 16, "open_folder")
             with Image.open(destination) as image:
                 self.assertEqual(image.size, (100, 100))
+
+    def test_microphone_artwork_has_no_frame_or_default_label(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "mic.jpg"
+            render_action_image(destination, "Mic", 16, "mic_mute")
+            with Image.open(destination) as image:
+                self.assertEqual(image.size, (100, 100))
+                background = image.getpixel((0, 0))
+                self.assertLess(sum(abs(left - right) for left, right in zip(image.getpixel((50, 17)), background)), 30)
 
     def test_structure_and_page_resolution(self) -> None:
         profile = {"scenes": {"default": {"pages": {"main": {"keys": {"1": {"action": "hotkey"}}}}}}}

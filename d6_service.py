@@ -565,14 +565,15 @@ def render_action_image(path: Path, label: str, font_size: int = 16, action_type
     outline = (53, 196, 190)
     accent = (45, 155, 216)
     light = (235, 250, 249)
-    draw.rounded_rectangle((2, 2, 97, 97), radius=10, outline=outline, width=3)
-    draw.line((15, 17, 85, 17), fill=accent, width=2)
     font_candidates = [
         Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeuib.ttf",
         Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arialbd.ttf",
     ]
     font_path = next((candidate for candidate in font_candidates if candidate.is_file()), None)
     action_type = (action_type or "label").lower()
+    if action_type != "mic_mute":
+        draw.rounded_rectangle((2, 2, 97, 97), radius=10, outline=outline, width=3)
+        draw.line((15, 17, 85, 17), fill=accent, width=2)
     if action_type == "open_folder":
         folder = [(13, 38), (13, 30), (35, 30), (41, 35), (86, 35), (86, 80), (13, 80)]
         draw.polygon(folder, fill=(11, 91, 119), outline=outline)
@@ -610,13 +611,13 @@ def render_action_image(path: Path, label: str, font_size: int = 16, action_type
         elif action_type == "mic_mute":
             mic_fill = (206, 57, 67) if muted else accent
             mic_outline = (255, 147, 153) if muted else outline
-            draw.rounded_rectangle((37, 18, 63, 53), radius=13, fill=mic_fill, outline=mic_outline, width=2)
-            draw.arc((25, 32, 75, 68), 0, 180, fill=mic_outline, width=4)
-            draw.line((50, 68, 50, 76), fill=mic_outline, width=4)
-            draw.line((38, 77, 62, 77), fill=mic_outline, width=4)
+            draw.rounded_rectangle((37, 22, 63, 56), radius=13, fill=mic_fill, outline=mic_outline, width=2)
+            draw.arc((25, 34, 75, 72), 0, 180, fill=mic_outline, width=4)
+            draw.line((50, 72, 50, 80), fill=mic_outline, width=4)
+            draw.line((38, 81, 62, 81), fill=mic_outline, width=4)
             if muted:
-                draw.line((27, 23, 73, 69), fill=(255, 203, 207), width=4)
-            text_box = (12, 80, 88, 96)
+                draw.line((27, 25, 73, 71), fill=(255, 203, 207), width=4)
+            text_box = (12, 82, 88, 98)
         elif action_type == "website":
             draw.ellipse((25, 24, 75, 68), outline=accent, width=4)
             draw.line((25, 46, 75, 46), fill=outline, width=2)
@@ -630,8 +631,10 @@ def render_action_image(path: Path, label: str, font_size: int = 16, action_type
         else:
             draw.rounded_rectangle((18, 28, 82, 64), radius=6, outline=accent, width=3)
             text_box = (12, 68, 88, 93)
-    chosen_font, chosen_lines = _fit_font(draw, font_path, label or BUILTIN_ACTION_LABELS.get(action_type, "Action"), font_size, text_box)
-    _draw_fitted_text(draw, chosen_font, chosen_lines, text_box, light)
+    display_label = "" if action_type == "mic_mute" and label in {"", BUILTIN_ACTION_LABELS["mic_mute"]} else label or BUILTIN_ACTION_LABELS.get(action_type, "Action")
+    if display_label:
+        chosen_font, chosen_lines = _fit_font(draw, font_path, display_label, font_size, text_box)
+        _draw_fitted_text(draw, chosen_font, chosen_lines, text_box, light)
     image.save(path, format="JPEG", quality=95, optimize=False)
     return path
 
