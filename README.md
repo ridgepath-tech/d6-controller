@@ -121,7 +121,7 @@ Click any key in the visual 15-key layout. The key opens its complete editor,
 including action selection, labels, font size, generated LCD preview, artwork
 upload/replacement/reset, and Delete Action. Available actions include:
 
-- built-in Back, Home, Previous, Next, Page Indicator, and deck Sleep;
+- built-in Back, Home, Previous, Next, Page Indicator, deck Sleep, and microphone mute;
 - Navigate to scene/page;
 - Open Website;
 - Open Folder, using a native Windows folder picker;
@@ -130,10 +130,10 @@ upload/replacement/reset, and Delete Action. Available actions include:
   the literal secret on the LCD.
 
 Generated artwork is designed for the D6's 100×100 LCD and is replaced by
-custom artwork when supplied. Apply the selected page to send the full layout
-to the deck. LCD labels use a multiline editor and preserve explicit line
-breaks; a labeled Open Folder action uses the generated folder artwork so its
-label remains visible.
+custom artwork when supplied. Labeled Open Folder actions preserve the custom
+folder artwork and draw the label over it. Apply the selected page to send the
+full layout to the deck. LCD labels use a multiline editor and preserve
+explicit line breaks.
 
 ### Codex page
 

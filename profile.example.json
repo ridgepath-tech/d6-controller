@@ -9,6 +9,9 @@
       "pages": {
         "main": {
           "keys": {
+            "7": {
+              "action": { "type": "mic_mute", "label": "Mic" }
+            },
             "11": {
               "action": {
                 "type": "navigate",

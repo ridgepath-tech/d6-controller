@@ -20,6 +20,7 @@ from d6_service import (
     load_profile,
     launch_target,
     normalize_profile,
+    render_labeled_custom_image,
     resolve_page,
     select_folder_native,
     save_profile,
@@ -67,6 +68,7 @@ class D6ServiceHelpersTests(unittest.TestCase):
         self.assertEqual(action_label({"type": "page_indicator"}, page_index=1, page_total=3), "2/3")
         self.assertEqual(action_label({"type": "website", "label": "Docs"}), "Docs")
         self.assertEqual(action_label({"type": "open_folder", "path": "D:\\Projects", "label": "Work\nProjects"}), "Work\nProjects")
+        self.assertEqual(action_label({"type": "mic_mute"}), "Mic")
 
     def test_lcd_label_layout_preserves_explicit_line_breaks(self) -> None:
         from PIL import Image, ImageDraw
@@ -74,6 +76,17 @@ class D6ServiceHelpersTests(unittest.TestCase):
         image = Image.new("RGB", (100, 100))
         _, lines = _fit_font(ImageDraw.Draw(image), None, "Work\nProjects", 16, (10, 10, 90, 90))
         self.assertEqual(lines, ["Work", "Projects"])
+
+    def test_labeled_custom_artwork_keeps_the_original_canvas(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "folder.png"
+            destination = Path(temporary) / "labeled.jpg"
+            Image.new("RGB", (1254, 1254), (45, 155, 216)).save(source)
+            render_labeled_custom_image(source, destination, "Work\nProjects", 16, "open_folder")
+            with Image.open(destination) as image:
+                self.assertEqual(image.size, (100, 100))
 
     def test_structure_and_page_resolution(self) -> None:
         profile = {"scenes": {"default": {"pages": {"main": {"keys": {"1": {"action": "hotkey"}}}}}}}
@@ -202,6 +215,18 @@ class D6ServiceHelpersTests(unittest.TestCase):
             with patch("d6_service.send_hotkey") as mocked:
                 service._dispatch_key(1)
             mocked.assert_called_once_with(["Ctrl", "Shift", "F1"])
+
+    def test_key_dispatch_toggles_microphone_and_refreshes_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_dir = Path(temporary)
+            profile = {"scenes": {"default": {"pages": {"main": {"keys": {"7": {"action": {"type": "mic_mute"}}}}}}}}
+            save_profile("default", profile, profile_dir)
+            service = D6Service(profile_dir)
+            service._set_active_context("default", "default", "main")
+            with patch("d6_service.toggle_microphone_mute", return_value=True), patch.object(service, "apply", return_value=1) as apply:
+                service._dispatch_key(7)
+            apply.assert_called_once_with(profile, "default", "main", profile_name="default")
+            self.assertEqual(service.recent_events[-1]["muted"], True)
 
     def test_key_dispatch_focuses_a_configured_folder(self) -> None:
         class FakeController:

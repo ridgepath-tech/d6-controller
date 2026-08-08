@@ -13,9 +13,9 @@ import re
 import shutil
 import subprocess
 import threading
-import textwrap
 import time
 import tempfile
+import uuid
 import zipfile
 import io
 from collections import deque
@@ -121,6 +121,23 @@ class _Input(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _InputUnion)]
 
 
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort), ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(value: str) -> _GUID:
+    parsed = uuid.UUID(value)
+    return _GUID(parsed.time_low, parsed.time_mid, parsed.time_hi_version, (ctypes.c_ubyte * 8)(*parsed.bytes[8:]))
+
+
+CLSID_MMDEVICE_ENUMERATOR = _guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
+IID_IMMDEVICE_ENUMERATOR = _guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
+IID_IAUDIO_ENDPOINT_VOLUME = _guid("5CDF2C82-841E-4546-9722-0CF74078229A")
+CLSCTX_INPROC_SERVER = 1
+E_CAPTURE = 1
+E_CONSOLE = 0
+
+
 class RequestDenied(PermissionError):
     """Raised when a request is not from the local configurator boundary."""
 
@@ -134,6 +151,7 @@ BUILTIN_ACTION_LABELS = {
     "next_page": "Next",
     "page_indicator": "Page",
     "sleep": "Sleep",
+    "mic_mute": "Mic",
 }
 BUILTIN_ACTION_TYPES = set(BUILTIN_ACTION_LABELS)
 RENDERED_ACTION_TYPES = BUILTIN_ACTION_TYPES | {"website", "launch", "open_folder", "navigate", "hotkey"}
@@ -480,10 +498,33 @@ def _fit_font(draw: Any, font_path: Path | None, text: str, requested_size: int,
     left, top, right, bottom = box
     for size in range(max(8, min(28, int(requested_size))), 7, -1):
         font = ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
-        width = max(5, int((right - left) / max(size * 0.58, 1)))
         lines: list[str] = []
         for paragraph in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            lines.extend(textwrap.wrap(paragraph, width=width, break_long_words=True, break_on_hyphens=False) or [""])
+            if not paragraph:
+                lines.append("")
+                continue
+            current = ""
+            for word in paragraph.split():
+                candidate = word if not current else f"{current} {word}"
+                if draw.textbbox((0, 0), candidate, font=font)[2] <= right - left:
+                    current = candidate
+                    continue
+                if current:
+                    lines.append(current)
+                current = ""
+                while word and draw.textbbox((0, 0), word, font=font)[2] > right - left:
+                    chunk = ""
+                    for character in word:
+                        if draw.textbbox((0, 0), chunk + character, font=font)[2] > right - left:
+                            break
+                        chunk += character
+                    if not chunk:
+                        chunk = word[0]
+                    lines.append(chunk)
+                    word = word[len(chunk):]
+                current = word
+            if current:
+                lines.append(current)
         lines = lines or ["Action"]
         widths = [draw.textbbox((0, 0), line, font=font)[2] for line in lines]
         height = sum(draw.textbbox((0, 0), line, font=font)[3] for line in lines) + max(0, len(lines) - 1) * 2
@@ -492,7 +533,14 @@ def _fit_font(draw: Any, font_path: Path | None, text: str, requested_size: int,
     return (ImageFont.truetype(str(font_path), 8) if font_path else ImageFont.load_default()), [line[:18] for line in str(text).splitlines() or ["Action"]]
 
 
-def _draw_fitted_text(draw: Any, font: Any, lines: list[str], box: tuple[int, int, int, int], fill: tuple[int, int, int]) -> None:
+def _draw_fitted_text(
+    draw: Any,
+    font: Any,
+    lines: list[str],
+    box: tuple[int, int, int, int],
+    fill: tuple[int, int, int],
+    shadow: tuple[int, int, int] | None = None,
+) -> None:
     left, top, right, bottom = box
     heights = [draw.textbbox((0, 0), line, font=font)[3] for line in lines]
     total_height = sum(heights) + max(0, len(lines) - 1) * 2
@@ -500,11 +548,13 @@ def _draw_fitted_text(draw: Any, font: Any, lines: list[str], box: tuple[int, in
     for line, height in zip(lines, heights):
         bbox = draw.textbbox((0, 0), line, font=font)
         x = left + max(0, (right - left - (bbox[2] - bbox[0])) / 2)
+        if shadow:
+            draw.text((x + 1, y + 1), line, fill=shadow, font=font)
         draw.text((x, y), line, fill=fill, font=font)
         y += height + 2
 
 
-def render_action_image(path: Path, label: str, font_size: int = 16, action_type: str | None = None) -> Path:
+def render_action_image(path: Path, label: str, font_size: int = 16, action_type: str | None = None, *, muted: bool = False) -> Path:
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as exc:
@@ -557,6 +607,16 @@ def render_action_image(path: Path, label: str, font_size: int = 16, action_type
             draw.ellipse((42, 17, 76, 52), fill=(7, 22, 34))
             draw.line((24, 70, 76, 70), fill=outline, width=3)
             text_box = (12, 74, 88, 93)
+        elif action_type == "mic_mute":
+            mic_fill = (206, 57, 67) if muted else accent
+            mic_outline = (255, 147, 153) if muted else outline
+            draw.rounded_rectangle((37, 18, 63, 53), radius=13, fill=mic_fill, outline=mic_outline, width=2)
+            draw.arc((25, 32, 75, 68), 0, 180, fill=mic_outline, width=4)
+            draw.line((50, 68, 50, 76), fill=mic_outline, width=4)
+            draw.line((38, 77, 62, 77), fill=mic_outline, width=4)
+            if muted:
+                draw.line((27, 23, 73, 69), fill=(255, 203, 207), width=4)
+            text_box = (12, 80, 88, 96)
         elif action_type == "website":
             draw.ellipse((25, 24, 75, 68), outline=accent, width=4)
             draw.line((25, 46, 75, 46), fill=outline, width=2)
@@ -574,6 +634,98 @@ def render_action_image(path: Path, label: str, font_size: int = 16, action_type
     _draw_fitted_text(draw, chosen_font, chosen_lines, text_box, light)
     image.save(path, format="JPEG", quality=95, optimize=False)
     return path
+
+
+def render_labeled_custom_image(source: Path, destination: Path, label: str, font_size: int, action_type: str) -> Path:
+    """Preserve custom artwork while adding the configured LCD label."""
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise D6Error("Pillow is required for LCD labels") from exc
+
+    image = Image.open(source).convert("RGB").resize(ACTION_IMAGE_SIZE, Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(image)
+    font_candidates = [
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeuib.ttf",
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arialbd.ttf",
+    ]
+    font_path = next((candidate for candidate in font_candidates if candidate.is_file()), None)
+    text_box = (8, 68, 92, 98) if action_type == "open_folder" else (12, 72, 88, 94)
+    chosen_font, chosen_lines = _fit_font(draw, font_path, label, font_size, text_box)
+    _draw_fitted_text(draw, chosen_font, chosen_lines, text_box, (235, 246, 255), shadow=(3, 12, 28))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image.save(destination, format="JPEG", quality=95, optimize=False)
+    return destination
+
+
+def _com_call(interface: ctypes.c_void_p, index: int, restype: Any, argtypes: list[Any], *args: Any) -> Any:
+    vtable = ctypes.cast(interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    function = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtable[index])
+    return function(interface, *args)
+
+
+def _com_release(interface: ctypes.c_void_p | None) -> None:
+    if interface:
+        _com_call(interface, 2, wintypes.ULONG, [],)
+
+
+def _with_microphone_endpoint(callback: Any) -> Any:
+    if os.name != "nt":
+        raise D6Error("microphone mute is only supported on Windows")
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoInitialize.restype = wintypes.LONG
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+    ole32.CoCreateInstance.argtypes = [ctypes.POINTER(_GUID), ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+    ole32.CoCreateInstance.restype = wintypes.LONG
+    ole32.CoInitialize(None)
+    enumerator = ctypes.c_void_p()
+    device = ctypes.c_void_p()
+    volume = ctypes.c_void_p()
+    try:
+        result = ole32.CoCreateInstance(ctypes.byref(CLSID_MMDEVICE_ENUMERATOR), None, CLSCTX_INPROC_SERVER, ctypes.byref(IID_IMMDEVICE_ENUMERATOR), ctypes.byref(enumerator))
+        if result < 0:
+            raise D6Error(f"could not initialize the Windows audio device enumerator (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        result = _com_call(enumerator, 4, wintypes.LONG, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)], E_CAPTURE, E_CONSOLE, ctypes.byref(device))
+        if result < 0:
+            raise D6Error(f"could not find the default microphone (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        result = _com_call(device, 3, wintypes.LONG, [ctypes.POINTER(_GUID), wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(IID_IAUDIO_ENDPOINT_VOLUME), CLSCTX_INPROC_SERVER, None, ctypes.byref(volume))
+        if result < 0:
+            raise D6Error(f"could not access the default microphone volume endpoint (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        return callback(volume)
+    finally:
+        _com_release(volume)
+        _com_release(device)
+        _com_release(enumerator)
+        ole32.CoUninitialize()
+
+
+def get_microphone_mute() -> bool:
+    def read_state(volume: ctypes.c_void_p) -> bool:
+        muted = wintypes.BOOL()
+        result = _com_call(volume, 15, wintypes.LONG, [ctypes.POINTER(wintypes.BOOL)], ctypes.byref(muted))
+        if result < 0:
+            raise D6Error(f"could not read microphone mute state (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        return bool(muted.value)
+
+    return bool(_with_microphone_endpoint(read_state))
+
+
+def toggle_microphone_mute() -> bool:
+    def toggle_state(volume: ctypes.c_void_p) -> bool:
+        muted = wintypes.BOOL()
+        result = _com_call(volume, 15, wintypes.LONG, [ctypes.POINTER(wintypes.BOOL)], ctypes.byref(muted))
+        if result < 0:
+            raise D6Error(f"could not read microphone mute state (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        next_state = not bool(muted.value)
+        result = _com_call(volume, 14, wintypes.LONG, [wintypes.BOOL, ctypes.c_void_p], wintypes.BOOL(next_state), None)
+        if result < 0:
+            raise D6Error(f"could not change microphone mute state (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        return next_state
+
+    return bool(_with_microphone_endpoint(toggle_state))
 
 
 def _key_vk(value: str) -> int | None:
@@ -1022,6 +1174,11 @@ class D6Service:
             with self.operation_lock:
                 controller.sleep_screen()
             self.publish_event({"type": "action", "key": key, "action": "sleep", "timestamp": time.time()})
+        elif action_type == "mic_mute":
+            with self.operation_lock:
+                muted = toggle_microphone_mute()
+                applied = self.apply(profile, scene, page, profile_name=profile_name)
+            self.publish_event({"type": "action", "key": key, "action": "mic_mute", "muted": muted, "count": applied, "timestamp": time.time()})
         elif action_type == "open_folder":
             folder = str(action.get("path") or "").strip()
             if not folder:
@@ -1077,12 +1234,35 @@ class D6Service:
                 controller.set_brightness(int(brightness))
             count = 0
             if isinstance(keys, dict):
+                microphone_muted: bool | None = None
                 for raw_key, definition in sorted(keys.items(), key=lambda item: int(item[0])):
                     if not isinstance(definition, dict):
                         continue
                     action = definition.get("action") if isinstance(definition.get("action"), dict) else None
                     action_type = str(action.get("type") or "").lower() if action else ""
-                    if action and action_type in RENDERED_ACTION_TYPES and not definition.get("image"):
+                    if action and action_type == "open_folder" and definition.get("image") and action.get("label"):
+                        source_path = (self.profile_dir / str(definition["image"])).resolve()
+                        if self.profile_dir not in source_path.parents or not source_path.is_file():
+                            raise FileNotFoundError(f"custom folder artwork not found: {definition['image']}")
+                        image_path = render_labeled_custom_image(
+                            source_path,
+                            _action_image_path(
+                                self.profile_dir,
+                                profile_name or "profile",
+                                selected_scene,
+                                selected_page,
+                                int(raw_key),
+                                {**action, "_custom_image": str(definition["image"])},
+                                page_index=selected_page_index,
+                                page_total=len(available_pages),
+                            ),
+                            action_label(action, page_index=selected_page_index, page_total=len(available_pages)),
+                            action_font_size(action),
+                            action_type,
+                        )
+                    elif action and action_type in RENDERED_ACTION_TYPES and not definition.get("image"):
+                        if action_type == "mic_mute" and microphone_muted is None:
+                            microphone_muted = get_microphone_mute()
                         image_path = render_action_image(
                             _action_image_path(
                                 self.profile_dir,
@@ -1097,6 +1277,7 @@ class D6Service:
                             action_label(action, page_index=selected_page_index, page_total=len(available_pages)),
                             action_font_size(action),
                             action_type,
+                            muted=bool(microphone_muted),
                         )
                     elif definition.get("image"):
                         image_path = (self.profile_dir / definition["image"]).resolve()
@@ -1411,16 +1592,33 @@ class D6RequestHandler(BaseHTTPRequestHandler):
         selected, selected_scene, selected_page = resolve_page(profile, scene, page)
         definition = key_definitions(profile, scene, page).get(str(int(key)), {})
         action = definition.get("action") if isinstance(definition, dict) else None
-        if not isinstance(action, dict) or definition.get("image"):
+        if not isinstance(action, dict):
             raise FileNotFoundError
         pages = page_names(profile, selected_scene)
         page_index = pages.index(selected_page) if selected_page in pages else 0
-        image_path = render_action_image(
-            _action_image_path(self.profile_dir, name, selected_scene, selected_page, int(key), action, page_index=page_index, page_total=len(pages)),
-            action_label(action, page_index=page_index, page_total=len(pages)),
-            action_font_size(action),
-            str(action.get("type") or "label"),
-        )
+        action_type = str(action.get("type") or "label")
+        label = action_label(action, page_index=page_index, page_total=len(pages))
+        if definition.get("image") and action_type == "open_folder" and action.get("label"):
+            source_path = (self.profile_dir / str(definition["image"])).resolve()
+            if self.profile_dir not in source_path.parents or not source_path.is_file():
+                raise FileNotFoundError
+            image_path = render_labeled_custom_image(
+                source_path,
+                _action_image_path(self.profile_dir, name, selected_scene, selected_page, int(key), {**action, "_custom_image": str(definition["image"])}, page_index=page_index, page_total=len(pages)),
+                label,
+                action_font_size(action),
+                action_type,
+            )
+        elif definition.get("image"):
+            raise FileNotFoundError
+        else:
+            image_path = render_action_image(
+                _action_image_path(self.profile_dir, name, selected_scene, selected_page, int(key), action, page_index=page_index, page_total=len(pages)),
+                label,
+                action_font_size(action),
+                action_type,
+                muted=get_microphone_mute() if action_type == "mic_mute" else False,
+            )
         body = image_path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
