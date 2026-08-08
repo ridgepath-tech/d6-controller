@@ -667,6 +667,15 @@ class D6Controller:
     def wake_screen(self) -> None:
         self.write_payload(b"CRT\0\0DIS\0\0")
 
+    def sleep_screen(self) -> None:
+        """Request the D6 LCDs enter device-sleep mode.
+
+        FIFINE exposes this as its device ``devsleep`` action.  The D6 accepts
+        the corresponding vendor-compatible CRT/SLP control frame.
+        """
+
+        self.write_payload(b"CRT\0\0SLP\0\0")
+
     def refresh(self) -> None:
         self.write_payload(b"CRT\0\0STP\0\0")
 
@@ -684,6 +693,7 @@ class D6Controller:
             "key_images": True,
             "brightness": True,
             "heartbeat": True,
+            "device_sleep": True,
             "rgb": D6_RGB_SUPPORTED,
         }
 

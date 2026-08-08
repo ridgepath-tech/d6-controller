@@ -4,6 +4,8 @@ import "./styles.css";
 
 const KEY_COUNT = 15;
 const KEY_LAYOUT = [11, 12, 13, 14, 15, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5];
+const BUILTIN_ACTION_LABELS = { back: "Back", home: "Home", previous_page: "Prev", next_page: "Next", page_indicator: "Page", sleep: "Sleep" };
+const BUILTIN_ACTION_TYPES = new Set(Object.keys(BUILTIN_ACTION_LABELS));
 
 function Icon({ name, size = 18 }) {
   const paths = {
@@ -69,7 +71,8 @@ function actionDisplayLabel(definition) {
   if (action.type === "hotkey") return hotkeyDisplayLabel(action);
   if (action.type === "navigate") return action.label || action.page || action.scene || "Navigate";
   if (action.type === "launch") return action.label || action.command || "Launch";
-  return action.type || "Action";
+  if (action.type === "website") return action.label || "Website";
+  return action.label || BUILTIN_ACTION_LABELS[action.type] || action.type || "Action";
 }
 
 function formatEvent(event) {
@@ -191,6 +194,7 @@ function App() {
       fontSize: action.type === "hotkey" ? String(action.font_size ?? 16) : "16",
       command: action.command || "",
       focusPath: action.focus_path || "",
+      url: action.url || "",
       error: "",
     });
   }
@@ -249,6 +253,25 @@ function App() {
         ...(modal.label.trim() ? { label: modal.label.trim() } : {}),
         ...(modal.focusPath.trim() ? { focus_path: modal.focusPath.trim() } : {}),
       };
+    } else if (modal.actionType === "website") {
+      if (!modal.url.trim()) {
+        updateModal("error", "Enter a website URL.");
+        return;
+      }
+      let parsed;
+      try {
+        parsed = new URL(modal.url.trim());
+      } catch {
+        updateModal("error", "Enter a valid http:// or https:// URL.");
+        return;
+      }
+      if (!["http:", "https:"].includes(parsed.protocol) || !parsed.host) {
+        updateModal("error", "Website actions require an http:// or https:// URL.");
+        return;
+      }
+      action = { type: "website", url: parsed.toString(), ...(modal.label.trim() ? { label: modal.label.trim() } : {}) };
+    } else if (BUILTIN_ACTION_TYPES.has(modal.actionType)) {
+      action = { type: modal.actionType };
     }
 
     const nextProfile = JSON.parse(JSON.stringify(profile));
@@ -402,8 +425,8 @@ function App() {
               const definition = keyDefinition(profile, scene, page, key);
               const action = definition.action;
               const actionLabel = actionDisplayLabel(definition);
-              const image = action?.type === "hotkey" ? "" : imageForKey(key);
-              const hasActionArt = action?.type === "hotkey";
+              const image = action?.type === "hotkey" || (action && (BUILTIN_ACTION_TYPES.has(action.type) || action.type === "website" || action.type === "launch") && !definition.image) ? "" : imageForKey(key);
+              const hasActionArt = action?.type === "hotkey" || Boolean(action && (BUILTIN_ACTION_TYPES.has(action.type) || action.type === "website" || action.type === "launch") && !definition.image);
               const actionFontSize = hasActionArt ? Math.max(8, Math.min(28, Number(action.font_size) || 16)) : undefined;
               return <button className={`deck-key ${selectedKey === key ? "selected" : ""} ${image || hasActionArt ? "has-image" : "empty"}`} key={key} onClick={() => setSelectedKey(key)} aria-label={`Key ${key}`}>
                 {image ? <img src={image} alt="" /> : hasActionArt ? <span className="action-art" style={{ fontSize: `${actionFontSize}px` }}>{actionLabel}</span> : <span className="empty-art"><Icon name="plus" size={22} /><span>Add artwork</span></span>}
@@ -439,10 +462,11 @@ function App() {
             <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setModal(null)}>Cancel</button><button type="submit" className="primary-button">Create {modal.kind}</button></div>
           </form> : <form onSubmit={(event) => { event.preventDefault(); saveAction(); }}>
             <div className="modal-heading"><div><span className="eyebrow">Selected key</span><h2 id="modal-title">Configure Key {String(selectedKey).padStart(2, "0")}</h2></div><button type="button" className="icon-button" aria-label="Close dialog" onClick={() => setModal(null)}>×</button></div>
-            <label className="modal-field"><span>Action</span><select value={modal.actionType} onChange={(event) => updateModal("actionType", event.target.value)}><option value="navigate">Navigate to scene/page</option><option value="hotkey">Send hotkey</option><option value="launch">Launch command</option><option value="none">No action</option></select></label>
+            <label className="modal-field"><span>Action</span><select value={modal.actionType} onChange={(event) => updateModal("actionType", event.target.value)}><option value="navigate">Navigate to scene/page</option><option value="back">Predefined back button</option><option value="home">Predefined home button</option><option value="previous_page">Previous page</option><option value="next_page">Next page</option><option value="page_indicator">Page indicator</option><option value="sleep">Sleep deck display</option><option value="website">Open website</option><option value="launch">Open app, file, or folder</option><option value="hotkey">Send hotkey or text</option><option value="none">No action</option></select></label>
             {modal.actionType === "navigate" && <div className="modal-two-column"><label className="modal-field"><span>Scene</span><select value={modal.targetScene} onChange={(event) => setModal((current) => current ? { ...current, targetScene: event.target.value, targetPage: pageList(profile, event.target.value)[0], error: "" } : current)}>{scenes.map((name) => <option key={name}>{name}</option>)}</select></label><label className="modal-field"><span>Page</span><select value={modal.targetPage} onChange={(event) => updateModal("targetPage", event.target.value)}>{pageList(profile, modal.targetScene).map((name) => <option key={name}>{name}</option>)}</select></label></div>}
             {modal.actionType === "hotkey" && <><label className="modal-field"><span>Keys</span><input autoFocus value={modal.keys} onChange={(event) => updateModal("keys", event.target.value)} placeholder="CTRL + SHIFT + F1 or password text" /></label><label className="modal-field"><span>LCD label</span><input value={modal.label} onChange={(event) => updateModal("label", event.target.value)} placeholder="Password or account name" /></label><label className="modal-field"><span>LCD font size (px)</span><input type="number" min="8" max="28" step="1" value={modal.fontSize} onChange={(event) => updateModal("fontSize", event.target.value)} /></label></>}
             {modal.actionType === "launch" && <><label className="modal-field"><span>Command</span><input autoFocus value={modal.command} onChange={(event) => updateModal("command", event.target.value)} placeholder="notepad.exe or leave blank for a folder" /></label><label className="modal-field"><span>LCD label</span><input value={modal.label} onChange={(event) => updateModal("label", event.target.value)} placeholder="Projects" /></label><label className="modal-field"><span>Focus folder path (optional)</span><input value={modal.focusPath} onChange={(event) => updateModal("focusPath", event.target.value)} placeholder="D:\\Projects" /></label></>}
+            {modal.actionType === "website" && <><label className="modal-field"><span>Website URL</span><input autoFocus type="url" value={modal.url} onChange={(event) => updateModal("url", event.target.value)} placeholder="https://example.com" /></label><label className="modal-field"><span>LCD label</span><input value={modal.label} onChange={(event) => updateModal("label", event.target.value)} placeholder="Website" /></label></>}
             <p className="modal-hint">The action is saved in the local profile. LCD artwork is sent when you apply the selected page.</p>
             {modal.error && <p className="modal-error">{modal.error}</p>}
             <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setModal(null)}>Cancel</button><button type="submit" className="primary-button">Save action</button></div>

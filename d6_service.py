@@ -113,6 +113,15 @@ class _Input(ctypes.Structure):
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 SW_RESTORE = 9
+BUILTIN_ACTION_LABELS = {
+    "back": "Back",
+    "home": "Home",
+    "previous_page": "Prev",
+    "next_page": "Next",
+    "page_indicator": "Page",
+    "sleep": "Sleep",
+}
+BUILTIN_ACTION_TYPES = set(BUILTIN_ACTION_LABELS)
 
 
 def _powershell_path_literal(path: Path) -> str:
@@ -233,6 +242,20 @@ def focus_explorer_path(path: str | Path, command: str | None = None, *, timeout
     return bring_window_to_foreground(hwnd) if hwnd is not None else False
 
 
+def open_website(url: str) -> None:
+    """Open an explicitly web-only action in the user's default browser."""
+
+    value = str(url or "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("website actions require an http:// or https:// URL")
+    startfile = getattr(os, "startfile", None)
+    if startfile:
+        startfile(value)
+    else:
+        subprocess.Popen(["xdg-open", value], creationflags=CREATE_NO_WINDOW)
+
+
 def valid_name(value: str) -> bool:
     return bool(value) and bool(NAME_PATTERN.fullmatch(value)) and value not in {".", ".."}
 
@@ -246,7 +269,7 @@ def _is_named_key(value: str) -> bool:
     return token in SPECIAL_VK or bool(re.fullmatch(r"F(?:[1-9]|1[0-9]|2[0-4])", token))
 
 
-def action_label(action: dict[str, Any] | None) -> str:
+def action_label(action: dict[str, Any] | None, *, page_index: int | None = None, page_total: int | None = None) -> str:
     """Return a safe LCD label without exposing literal text-entry secrets."""
 
     if not isinstance(action, dict):
@@ -264,6 +287,12 @@ def action_label(action: dict[str, Any] | None) -> str:
         return str(action.get("page") or action.get("scene") or "Navigate")
     if action_type == "launch":
         return str(action.get("command") or "Launch")
+    if action_type == "website":
+        return "Website"
+    if action_type == "page_indicator" and page_index is not None and page_total:
+        return f"{page_index + 1}/{page_total}"
+    if action_type in BUILTIN_ACTION_LABELS:
+        return BUILTIN_ACTION_LABELS[action_type]
     return action_type.title() or "Action"
 
 
@@ -482,6 +511,7 @@ class D6Service:
         self.active_profile_name: str | None = None
         self.active_scene: str | None = None
         self.active_page: str | None = None
+        self.navigation_history: list[tuple[str, str, str]] = []
         self.report_count = 0
         self.decoded_event_count = 0
         self.ignored_report_count = 0
@@ -657,10 +687,19 @@ class D6Service:
         if not isinstance(action, dict):
             return
         action_type = str(action.get("type") or "").strip().lower()
+
+        def apply_target(target_profile_name: str, target_scene: str, target_page: str, *, record_history: bool = True) -> int:
+            current = (profile_name, scene, page)
+            target = (target_profile_name, target_scene, target_page)
+            if record_history and target != current:
+                self.navigation_history.append(current)
+            target_profile = load_profile(target_profile_name, self.profile_dir)
+            return self.apply(target_profile, target_scene, target_page, profile_name=target_profile_name)
+
         if action_type == "navigate":
             target_scene = str(action.get("scene") or scene)
             target_page = str(action.get("page") or page)
-            applied = self.apply(profile, target_scene, target_page, profile_name=profile_name)
+            applied = apply_target(profile_name, target_scene, target_page)
             self.publish_event(
                 {
                     "type": "action",
@@ -672,6 +711,36 @@ class D6Service:
                     "timestamp": time.time(),
                 }
             )
+        elif action_type == "back":
+            destination: tuple[str, str, str] | None = None
+            while self.navigation_history:
+                candidate = self.navigation_history.pop()
+                try:
+                    candidate_profile = load_profile(candidate[0], self.profile_dir)
+                    resolve_page(candidate_profile, candidate[1], candidate[2])
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                destination = candidate
+                break
+            if destination is None:
+                destination = (profile_name, scene, "main" if "main" in page_names(profile, scene) else page_names(profile, scene)[0])
+            applied = apply_target(*destination, record_history=False)
+            self.publish_event({"type": "action", "key": key, "action": "back", "scene": destination[1], "page": destination[2], "count": applied, "timestamp": time.time()})
+        elif action_type == "home":
+            home_scene = "default" if "default" in scene_names(profile) else scene_names(profile)[0]
+            home_pages = page_names(profile, home_scene)
+            home_page = "main" if "main" in home_pages else home_pages[0]
+            applied = apply_target(profile_name, home_scene, home_page)
+            self.publish_event({"type": "action", "key": key, "action": "home", "scene": home_scene, "page": home_page, "count": applied, "timestamp": time.time()})
+        elif action_type in {"previous_page", "next_page"}:
+            pages = page_names(profile, scene)
+            current_index = pages.index(page) if page in pages else 0
+            delta = -1 if action_type == "previous_page" else 1
+            target_page = pages[(current_index + delta) % len(pages)]
+            applied = apply_target(profile_name, scene, target_page)
+            self.publish_event({"type": "action", "key": key, "action": action_type, "scene": scene, "page": target_page, "count": applied, "timestamp": time.time()})
+        elif action_type == "page_indicator":
+            self.publish_event({"type": "action", "key": key, "action": "page_indicator", "scene": scene, "page": page, "timestamp": time.time()})
         elif action_type == "hotkey":
             with self.operation_lock:
                 send_hotkey(action.get("keys", []))
@@ -684,6 +753,17 @@ class D6Service:
                     "timestamp": time.time(),
                 }
             )
+        elif action_type == "website":
+            with self.operation_lock:
+                open_website(str(action.get("url") or ""))
+            self.publish_event({"type": "action", "key": key, "action": "website", "label": action_label(action), "timestamp": time.time()})
+        elif action_type == "sleep":
+            controller = self._current_controller()
+            if controller is None:
+                raise D6Error("D6 is not connected")
+            with self.operation_lock:
+                controller.sleep_screen()
+            self.publish_event({"type": "action", "key": key, "action": "sleep", "timestamp": time.time()})
         elif action_type == "launch":
             command = str(action.get("command") or "").strip()
             focus_path = str(action.get("focus_path") or "").strip()
@@ -718,6 +798,8 @@ class D6Service:
         device = profile.get("device", {})
         brightness = selected.get("brightness", device.get("brightness"))
         keys = selected.get("keys", selected)
+        available_pages = page_names(profile, selected_scene)
+        selected_page_index = available_pages.index(selected_page) if selected_page in available_pages else 0
         with self.operation_lock:
             # A page describes the complete 15-key layout. Clear artwork left
             # by the previous page so empty keys do not retain stale images.
@@ -730,7 +812,8 @@ class D6Service:
                     if not isinstance(definition, dict):
                         continue
                     action = definition.get("action") if isinstance(definition.get("action"), dict) else None
-                    if action and str(action.get("type") or "").lower() == "hotkey":
+                    action_type = str(action.get("type") or "").lower() if action else ""
+                    if action and action_type == "hotkey":
                         image_path = render_action_image(
                             _action_image_path(
                                 self.profile_dir,
@@ -741,6 +824,19 @@ class D6Service:
                                 action,
                             ),
                             action_label(action),
+                            action_font_size(action),
+                        )
+                    elif action and (action_type in BUILTIN_ACTION_TYPES or action_type in {"website", "launch"}) and not definition.get("image"):
+                        image_path = render_action_image(
+                            _action_image_path(
+                                self.profile_dir,
+                                profile_name or "profile",
+                                selected_scene,
+                                selected_page,
+                                int(raw_key),
+                                action,
+                            ),
+                            action_label(action, page_index=selected_page_index, page_total=len(available_pages)),
                             action_font_size(action),
                         )
                     elif definition.get("image"):

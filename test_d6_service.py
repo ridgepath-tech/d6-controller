@@ -44,6 +44,9 @@ class D6ServiceHelpersTests(unittest.TestCase):
         self.assertEqual(action_label({"type": "hotkey", "keys": ["CTRL", "Shift", "F1"]}), "CTRL + Shift + F1")
         self.assertEqual(action_label({"type": "hotkey", "keys": ["DemoSecret!983"]}), "Password")
         self.assertEqual(action_label({"type": "hotkey", "keys": ["DemoSecret!983"], "label": "Work account"}), "Work account")
+        self.assertEqual(action_label({"type": "back"}), "Back")
+        self.assertEqual(action_label({"type": "page_indicator"}, page_index=1, page_total=3), "2/3")
+        self.assertEqual(action_label({"type": "website", "label": "Docs"}), "Docs")
 
     def test_structure_and_page_resolution(self) -> None:
         profile = {"scenes": {"default": {"pages": {"main": {"keys": {"1": {"action": "hotkey"}}}}}}}
@@ -152,6 +155,44 @@ class D6ServiceHelpersTests(unittest.TestCase):
             with patch("d6_service.focus_explorer_path") as mocked:
                 service._dispatch_key(12)
             mocked.assert_called_once_with("D:\\Projects", 'explorer.exe /n,/root,\\\"D:\\\\Projects\\\"')
+
+    def test_key_dispatch_supports_page_controls_and_website(self) -> None:
+        class FakeController:
+            def clear_screen(self) -> None:
+                return None
+
+            def set_key_image(self, key, path) -> None:
+                return None
+
+            def sleep_screen(self) -> None:
+                self.slept = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_dir = Path(temporary)
+            profile = {
+                "scenes": {
+                    "default": {
+                        "pages": {
+                            "main": {"keys": {"1": {"action": {"type": "navigate", "page": "Second"}}}},
+                            "Second": {"keys": {"1": {"action": {"type": "previous_page"}}, "2": {"action": {"type": "website", "url": "https://example.com"}}, "3": {"action": {"type": "sleep"}}}},
+                        }
+                    }
+                }
+            }
+            save_profile("default", profile, profile_dir)
+            service = D6Service(profile_dir)
+            service.controller = FakeController()
+            service._set_active_context("default", "default", "main")
+            service._dispatch_key(1)
+            self.assertEqual(service.active_page, "Second")
+            service._dispatch_key(1)
+            self.assertEqual(service.active_page, "main")
+            with patch("d6_service.open_website") as mocked:
+                service._set_active_context("default", "default", "Second")
+                service._dispatch_key(2)
+            mocked.assert_called_once_with("https://example.com")
+            service._dispatch_key(3)
+            self.assertTrue(service.controller.slept)
 
 
 class D6ServiceHttpTests(unittest.TestCase):

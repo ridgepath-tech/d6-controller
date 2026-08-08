@@ -54,9 +54,17 @@ class ProtocolTests(unittest.TestCase):
                 "key_images": True,
                 "brightness": True,
                 "heartbeat": True,
+                "device_sleep": True,
                 "rgb": False,
             },
         )
+
+    def test_sleep_screen_uses_vendor_device_sleep_frame(self):
+        controller = D6Controller.__new__(D6Controller)
+        sent = []
+        controller.write_payload = lambda payload: sent.append(payload)
+        controller.sleep_screen()
+        self.assertEqual(sent, [b"CRT\0\0SLP\0\0"])
 
     def test_decode_accepts_windows_report_shape(self):
         report = bytearray(REPORT_SIZE)
