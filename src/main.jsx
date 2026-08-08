@@ -187,9 +187,10 @@ function App() {
       targetScene: action.scene || scene,
       targetPage: action.page || page,
       keys: Array.isArray(action.keys) ? action.keys.join(" + ") : "",
-      label: action.type === "hotkey" ? hotkeyDisplayLabel(action) : "",
+      label: action.label || (action.type === "hotkey" ? hotkeyDisplayLabel(action) : ""),
       fontSize: action.type === "hotkey" ? String(action.font_size ?? 16) : "16",
       command: action.command || "",
+      focusPath: action.focus_path || "",
       error: "",
     });
   }
@@ -238,11 +239,16 @@ function App() {
       const fontSize = Math.max(8, Math.min(28, Number.parseInt(modal.fontSize, 10) || 16));
       action = { type: "hotkey", keys, font_size: fontSize, ...(modal.label.trim() ? { label: modal.label.trim() } : {}) };
     } else if (modal.actionType === "launch") {
-      if (!modal.command.trim()) {
-        updateModal("error", "Enter a command to launch.");
+      if (!modal.command.trim() && !modal.focusPath.trim()) {
+        updateModal("error", "Enter a command or a folder path to open.");
         return;
       }
-      action = { type: "launch", command: modal.command.trim() };
+      action = {
+        type: "launch",
+        ...(modal.command.trim() ? { command: modal.command.trim() } : {}),
+        ...(modal.label.trim() ? { label: modal.label.trim() } : {}),
+        ...(modal.focusPath.trim() ? { focus_path: modal.focusPath.trim() } : {}),
+      };
     }
 
     const nextProfile = JSON.parse(JSON.stringify(profile));
@@ -436,7 +442,7 @@ function App() {
             <label className="modal-field"><span>Action</span><select value={modal.actionType} onChange={(event) => updateModal("actionType", event.target.value)}><option value="navigate">Navigate to scene/page</option><option value="hotkey">Send hotkey</option><option value="launch">Launch command</option><option value="none">No action</option></select></label>
             {modal.actionType === "navigate" && <div className="modal-two-column"><label className="modal-field"><span>Scene</span><select value={modal.targetScene} onChange={(event) => setModal((current) => current ? { ...current, targetScene: event.target.value, targetPage: pageList(profile, event.target.value)[0], error: "" } : current)}>{scenes.map((name) => <option key={name}>{name}</option>)}</select></label><label className="modal-field"><span>Page</span><select value={modal.targetPage} onChange={(event) => updateModal("targetPage", event.target.value)}>{pageList(profile, modal.targetScene).map((name) => <option key={name}>{name}</option>)}</select></label></div>}
             {modal.actionType === "hotkey" && <><label className="modal-field"><span>Keys</span><input autoFocus value={modal.keys} onChange={(event) => updateModal("keys", event.target.value)} placeholder="CTRL + SHIFT + F1 or password text" /></label><label className="modal-field"><span>LCD label</span><input value={modal.label} onChange={(event) => updateModal("label", event.target.value)} placeholder="Password or account name" /></label><label className="modal-field"><span>LCD font size (px)</span><input type="number" min="8" max="28" step="1" value={modal.fontSize} onChange={(event) => updateModal("fontSize", event.target.value)} /></label></>}
-            {modal.actionType === "launch" && <label className="modal-field"><span>Command</span><input autoFocus value={modal.command} onChange={(event) => updateModal("command", event.target.value)} placeholder="notepad.exe" /></label>}
+            {modal.actionType === "launch" && <><label className="modal-field"><span>Command</span><input autoFocus value={modal.command} onChange={(event) => updateModal("command", event.target.value)} placeholder="notepad.exe or leave blank for a folder" /></label><label className="modal-field"><span>LCD label</span><input value={modal.label} onChange={(event) => updateModal("label", event.target.value)} placeholder="Projects" /></label><label className="modal-field"><span>Focus folder path (optional)</span><input value={modal.focusPath} onChange={(event) => updateModal("focusPath", event.target.value)} placeholder="D:\\Projects" /></label></>}
             <p className="modal-hint">The action is saved in the local profile. LCD artwork is sent when you apply the selected page.</p>
             {modal.error && <p className="modal-error">{modal.error}</p>}
             <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setModal(null)}>Cancel</button><button type="submit" className="primary-button">Save action</button></div>
