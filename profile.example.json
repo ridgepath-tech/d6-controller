@@ -8,13 +8,29 @@
     "default": {
       "pages": {
         "main": {
-          "keys": {}
+          "keys": {
+            "11": {
+              "action": {
+                "type": "navigate",
+                "scene": "default",
+                "page": "Codex",
+                "label": "Codex"
+              }
+            }
+          }
         },
         "Password Entry": {
           "keys": {}
         },
         "Codex": {
-          "keys": {}
+          "keys": {
+            "10": { "action": { "type": "sleep", "label": "Sleep" } },
+            "11": { "action": { "type": "home", "label": "Home" } },
+            "12": { "action": { "type": "back", "label": "Back" } },
+            "13": { "action": { "type": "previous_page", "label": "Prev" } },
+            "14": { "action": { "type": "next_page", "label": "Next" } },
+            "15": { "action": { "type": "page_indicator" } }
+          }
         }
       }
     }

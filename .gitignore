@@ -9,6 +9,7 @@ node_modules/
 dist/
 
 # User-specific controller state and artwork
+data/
 profiles/*.json
 !profiles/.gitkeep
 profiles/assets/*

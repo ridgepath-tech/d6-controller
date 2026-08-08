@@ -1,8 +1,10 @@
 # D6 Controller
 
-This repository contains a local Windows controller for the FIFINE AmpliGame
-D6. It provides a browser-based profile editor, page navigation, per-button
-LCD artwork, hotkey/password entry, launch actions, and live device events.
+This repository contains an independent local Windows controller for the
+FIFINE AmpliGame D6 Stream Controller. It provides a browser-based profile
+editor, page navigation, per-button LCD artwork, hotkey/password entry,
+website/app/folder actions, Codex-oriented controller pages, and live device
+events.
 It controls the device directly and does not require the vendor application to
 be running at the same time.
 
@@ -41,6 +43,11 @@ public template, and registers a `D6 Controller` task to start the service when
 the current user logs on. If local policy prevents a standard user from
 creating a task, it automatically uses the current-user `HKCU` startup entry
 instead. Existing local profiles are preserved.
+
+The first visit opens an in-app administrator setup screen. Choose a local
+password of at least 10 characters; only a salted `scrypt` verifier is stored.
+The service remains bound to `127.0.0.1`, and authenticated configuration
+requests use an HttpOnly, SameSite session cookie.
 
 To remove only the automatic launch task:
 
@@ -108,6 +115,40 @@ WinUSB driver binding. Run `python .\\d6_controller.py transport-info` to
 inspect the available interface paths and endpoint binding without sending
 device commands.
 
+### Configure a key
+
+Click any key in the visual 15-key layout. The key opens its complete editor,
+including action selection, labels, font size, generated LCD preview, artwork
+upload/replacement/reset, and Delete Action. Available actions include:
+
+- built-in Back, Home, Previous, Next, Page Indicator, and deck Sleep;
+- Navigate to scene/page;
+- Open Website;
+- Open Folder, using a native Windows folder picker;
+- Open app, file, or folder through the generic launch action; and
+- Send hotkey or text, including password-entry text that is never rendered as
+  the literal secret on the LCD.
+
+Generated artwork is designed for the D6's 100×100 LCD and is replaced by
+custom artwork when supplied. Apply the selected page to send the full layout
+to the deck.
+
+### Codex page
+
+The public starter profile includes an internal `Codex` page rather than a
+website redirect. It provides the common deck controls (Home, Back, Previous,
+Next, Page Indicator, and Sleep). The installed Codex desktop executable is
+machine-specific, so an optional Open Codex launch action should be configured
+locally after verifying the installed application path. No undocumented voice,
+accept/reject, or agent shortcut is hardcoded.
+
+### Settings and backups
+
+Settings provides password changes, sign out, and a portable `.d6config`
+backup/restore flow. Backups include profiles and LCD artwork, are schema
+versioned, and are restored transactionally after ZIP path and structure
+validation. Backups may contain password-entry actions, so store them securely.
+
 ## Current limitations
 
 The connected D6 reports no lamp-control capability through the installed
@@ -115,3 +156,8 @@ vendor library, and the vendor settings page exposes no RGB controls. RGB is
 therefore reported as unsupported for this unit; the generic QUCMD primitive
 is retained only for future firmware/device comparison. The controller
 deliberately does not send firmware-update or flash commands.
+
+RidgePath D6 Controller is an independent third-party project and is not
+affiliated with or endorsed by FIFINE or OpenAI. Product and company names are
+used only to identify compatible hardware and services. All marks remain the
+property of their respective owners.

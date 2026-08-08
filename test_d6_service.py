@@ -1,11 +1,14 @@
 import json
+import io
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
-from urllib.request import urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
+from d6_auth import AuthError, AuthStore
 from d6_service import (
     D6HTTPServer,
     D6Service,
@@ -15,12 +18,27 @@ from d6_service import (
     focus_explorer_path,
     key_definitions,
     load_profile,
+    launch_target,
+    normalize_profile,
     resolve_page,
+    select_folder_native,
     save_profile,
 )
 
 
 class D6ServiceHelpersTests(unittest.TestCase):
+    def test_auth_store_hashes_password_and_rotates_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = AuthStore(Path(temporary) / "auth.json")
+            token = store.setup("TestPassword123", "TestPassword123")
+            self.assertTrue(store.session_valid(token))
+            self.assertNotIn("TestPassword123", Path(temporary, "auth.json").read_text())
+            with self.assertRaises(AuthError):
+                store.login("wrong-password")
+            rotated = store.change_password(token, "NewPassword123", "NewPassword123")
+            self.assertFalse(store.session_valid(token))
+            self.assertTrue(store.session_valid(rotated))
+
     def test_refresh_forwards_signal_to_controller(self) -> None:
         class FakeController:
             def refresh(self) -> None:
@@ -61,6 +79,63 @@ class D6ServiceHelpersTests(unittest.TestCase):
         self.assertEqual(selected, {"keys": {}})
         self.assertEqual(key_definitions(profile, "default", "main")["1"]["action"], "hotkey")
 
+    def test_legacy_explorer_launch_normalizes_to_open_folder(self) -> None:
+        profile = {"scenes": {"default": {"pages": {"main": {"keys": {"12": {"action": {"type": "launch", "command": "explorer.exe /n,/root,\\\"D:\\\\Projects\\\"", "focus_path": "D:\\Projects", "label": "Projects"}}}}}}}}
+        normalized = normalize_profile(profile)
+        self.assertEqual(normalized["scenes"]["default"]["pages"]["main"]["keys"]["12"]["action"]["type"], "open_folder")
+
+    def test_backup_round_trip_preserves_profile_and_artwork_without_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_dir = Path(temporary) / "profiles"
+            data_dir = Path(temporary) / "data"
+            profile_dir.mkdir()
+            (profile_dir / "assets").mkdir()
+            save_profile("default", {"scenes": {"default": {"pages": {"main": {"keys": {"1": {"image": "assets/one.jpg"}}}}}}}, profile_dir)
+            (profile_dir / "assets" / "one.jpg").write_bytes(b"art")
+            service = D6Service(profile_dir, data_dir)
+            service.auth.setup("TestPassword123", "TestPassword123")
+            backup = service.export_config()
+            self.assertNotIn(b"auth.json", backup)
+            (profile_dir / "default.json").unlink()
+            (profile_dir / "assets" / "one.jpg").unlink()
+            restored = service.restore_config(backup)
+            self.assertEqual(restored, ["default"])
+            self.assertTrue((profile_dir / "assets" / "one.jpg").is_file())
+
+    def test_backup_rejects_zip_slip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            service = D6Service(Path(temporary) / "profiles", Path(temporary) / "data")
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w") as archive:
+                archive.writestr("manifest.json", json.dumps({"format": "d6config", "schema_version": 1}))
+                archive.writestr("../outside.json", "bad")
+            with self.assertRaises(ValueError):
+                service.restore_config(stream.getvalue())
+
+    def test_native_folder_picker_returns_selection_cancel_and_rejects_bad_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            selected = Path(temporary).resolve()
+            completed = type("Completed", (), {"stdout": f"{selected}\n"})()
+            with patch("d6_service.subprocess.run", return_value=completed):
+                self.assertEqual(select_folder_native(), str(selected))
+            cancelled = type("Completed", (), {"stdout": ""})()
+            with patch("d6_service.subprocess.run", return_value=cancelled):
+                self.assertIsNone(select_folder_native())
+            malformed = type("Completed", (), {"stdout": "C:\\does-not-exist\\d6\n"})()
+            with patch("d6_service.subprocess.run", return_value=malformed):
+                with self.assertRaises(ValueError):
+                    select_folder_native()
+
+    def test_launch_target_activates_a_new_window_with_a_bounded_helper(self) -> None:
+        class FakeProcess:
+            pid = 42
+
+        with patch("d6_service.subprocess.Popen", return_value=FakeProcess()), patch("d6_service.find_window_for_process", return_value=99), patch("d6_service.bring_window_to_foreground", return_value=True) as focus:
+            result = launch_target("notepad.exe")
+        self.assertEqual(result["pid"], 42)
+        self.assertTrue(result["focused"])
+        focus.assert_called_once_with(99)
+
     def test_profile_round_trip_is_atomic_at_helper_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             profile_dir = Path(temporary)
@@ -81,7 +156,7 @@ class D6ServiceHelpersTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             profile_dir = Path(temporary)
-            service = D6Service(profile_dir)
+            service = D6Service(profile_dir, Path(temporary) / "data")
             controller = FakeController()
             service.controller = controller
             profile = {"scenes": {"default": {"pages": {"main": {"keys": {"1": {"action": {"type": "hotkey", "keys": ["CTRL", "Shift", "F1"]}}}}}}}}
@@ -154,7 +229,7 @@ class D6ServiceHelpersTests(unittest.TestCase):
             service._set_active_context("default", "default", "main")
             with patch("d6_service.focus_explorer_path") as mocked:
                 service._dispatch_key(12)
-            mocked.assert_called_once_with("D:\\Projects", 'explorer.exe /n,/root,\\\"D:\\\\Projects\\\"')
+            mocked.assert_called_once_with("D:\\Projects", timeout=4.0)
 
     def test_key_dispatch_supports_page_controls_and_website(self) -> None:
         class FakeController:
@@ -200,13 +275,20 @@ class D6ServiceHttpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             profile_dir = Path(temporary)
             save_profile("default", {"scenes": {}}, profile_dir)
-            service = D6Service(profile_dir)
+            service = D6Service(profile_dir, Path(temporary) / "data")
             server = D6HTTPServer(("127.0.0.1", 0), service)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
                 base_url = f"http://127.0.0.1:{server.server_address[1]}"
-                with urlopen(f"{base_url}/api/state") as response:
+                with urlopen(f"{base_url}/api/auth/status") as response:
+                    status = json.load(response)
+                self.assertTrue(status["setup_required"])
+                opener = build_opener(HTTPCookieProcessor())
+                setup_request = Request(f"{base_url}/api/auth/setup", data=json.dumps({"password": "TestPassword123", "confirmation": "TestPassword123"}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+                with opener.open(setup_request) as response:
+                    self.assertEqual(response.status, 200)
+                with opener.open(f"{base_url}/api/state") as response:
                     state = json.load(response)
                 self.assertEqual(state["profiles"], ["default"])
                 self.assertIn("capabilities", state["device"])
