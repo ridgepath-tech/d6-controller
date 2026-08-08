@@ -78,8 +78,12 @@ select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px #6ea8ff24; }
 .deck-frame { display: flex; min-height: 0; align-items: center; justify-content: center; overflow: hidden; padding: 12px; border: 1px solid #3c454e; border-radius: 14px; background: #1a2026; box-shadow: 0 14px 32px #080a0d66, inset 0 1px #ffffff08; }
 .deck-grid { display: grid; width: auto; height: 100%; max-width: 100%; aspect-ratio: 5 / 3; grid-template-columns: repeat(5, minmax(0, 1fr)); grid-template-rows: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .deck-key { position: relative; overflow: hidden; display: grid; place-items: center; min-width: 0; min-height: 0; padding: 0; border: 2px solid #080a0d; border-radius: 11px; color: #dfe7ef; background: #20262e; box-shadow: 0 4px 0 #07090b, 0 7px 11px #07090b88; cursor: pointer; transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease; }
+.deck-key.draggable { cursor: grab; touch-action: none; }
+.deck-key.draggable:active { cursor: grabbing; }
 .deck-key:hover { transform: translateY(-2px); border-color: #597ba9; }
 .deck-key.selected { border-color: var(--blue); box-shadow: 0 5px 0 #09111d, 0 0 0 3px #6ea8ff2a, 0 9px 17px #07090baa; }
+.deck-key.drag-source { opacity: .45; transform: scale(.98); }
+.deck-key.drag-target { border-color: #9ac8ff; background: #263d59; box-shadow: 0 0 0 3px #6ea8ff44, 0 7px 15px #07090baa; }
 .deck-key img { width: 100%; height: 100%; object-fit: cover; }
 .empty-art { display: grid; place-items: center; gap: 7px; color: #687482; font-size: 10px; }
 .key-overlay { position: absolute; inset: auto 0 0; display: flex; justify-content: space-between; align-items: center; padding: 7px 9px; color: #f4f7fa; background: #0e1319d9; font-size: 10px; }
@@ -125,6 +129,7 @@ input[type="range"] { width: 100%; height: 5px; margin-top: 8px; accent-color: v
 .modal-field { display: grid; gap: 7px; margin-top: 14px; color: #dce3e9; font-size: 12px; font-weight: 650; }
 .modal-field input, .modal-field select, .modal-field textarea { width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; color: var(--text); background: var(--surface); }
 .modal-field textarea { min-height: 64px; resize: vertical; line-height: 1.3; }
+.modal-copy { margin: 0; color: #dce3e9; font-size: 12px; line-height: 1.55; }
 .modal-field input:focus, .modal-field select:focus, .modal-field textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px #6ea8ff24; }
 .modal-two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .modal-hint { margin: 14px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
