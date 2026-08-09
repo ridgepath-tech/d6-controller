@@ -136,10 +136,12 @@ class _WNDCLASSW(ctypes.Structure):
         ("lpfnWndProc", ctypes.c_void_p),
         ("cbClsExtra", ctypes.c_int),
         ("cbWndExtra", ctypes.c_int),
-        ("hInstance", wintypes.HINSTANCE),
-        ("hIcon", wintypes.HICON),
-        ("hCursor", wintypes.HCURSOR),
-        ("hbrBackground", wintypes.HBRUSH),
+        # ctypes.wintypes does not expose every Win32 handle alias on every
+        # supported Python version. They are all pointer-sized handles here.
+        ("hInstance", wintypes.HANDLE),
+        ("hIcon", wintypes.HANDLE),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HANDLE),
         ("lpszMenuName", wintypes.LPCWSTR),
         ("lpszClassName", wintypes.LPCWSTR),
     ]
