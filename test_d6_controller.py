@@ -2,7 +2,14 @@ import unittest
 import struct
 from pathlib import Path
 
-from d6_controller import D6Controller, HEARTBEAT_PAYLOAD, KEY_TO_DEVICE_ID, KEY_TO_IMAGE_DEVICE_ID, REPORT_SIZE
+from d6_controller import (
+    D6Controller,
+    HEARTBEAT_PAYLOAD,
+    KEY_TO_DEVICE_ID,
+    KEY_TO_IMAGE_DEVICE_ID,
+    REPORT_DATA_SIZE,
+    REPORT_SIZE,
+)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -93,6 +100,22 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(header[0:10], b"CRT\0\0BAT\0\0")
         self.assertEqual(header[10:12], b"\x12\x34")
         self.assertEqual(header[12], 0x0B)
+
+    def test_boot_logo_requires_explicit_confirmation(self):
+        controller = D6Controller.__new__(D6Controller)
+        with self.assertRaisesRegex(RuntimeError, "persistent"):
+            controller.set_boot_logo(b"jpeg", confirm_write=False)
+
+    def test_boot_logo_uses_vendor_size_and_finish_frames(self):
+        controller = D6Controller.__new__(D6Controller)
+        sent = []
+        controller.write_payload = lambda payload: sent.append(payload)
+        image = b"jpeg" * 200
+        controller.set_boot_logo(image, confirm_write=True)
+        self.assertEqual(sent[0], b"CRT\0\0LOG" + struct.pack(">I", len(image)) + b"\0")
+        self.assertEqual(b"".join(sent[1:-1]), image)
+        self.assertEqual(sent[-1], b"CRT\0ULEND")
+        self.assertEqual(len(sent[1]), REPORT_DATA_SIZE)
 
 
 if __name__ == "__main__":

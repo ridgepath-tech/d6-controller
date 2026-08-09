@@ -8,13 +8,35 @@
     "default": {
       "pages": {
         "main": {
-          "keys": {}
+          "keys": {
+            "5": {
+              "action": { "type": "sleep" },
+              "image": "assets\\sleep.png"
+            },
+            "7": {
+              "action": { "type": "mic_mute" }
+            },
+            "11": {
+              "action": {
+                "type": "navigate",
+                "scene": "default",
+                "page": "Codex",
+                "label": "Codex"
+              },
+              "image": "assets\\codex.png"
+            }
+          }
         },
         "Password Entry": {
           "keys": {}
         },
         "Codex": {
-          "keys": {}
+          "keys": {
+            "1": {
+              "action": { "type": "home" },
+              "image": "assets\\home.png"
+            }
+          }
         }
       }
     }

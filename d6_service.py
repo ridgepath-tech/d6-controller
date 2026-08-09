@@ -10,10 +10,16 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import subprocess
+import sys
 import threading
-import textwrap
 import time
+import tempfile
+import uuid
+import webbrowser
+import zipfile
+import io
 from collections import deque
 from ctypes import wintypes
 from http import HTTPStatus
@@ -23,14 +29,29 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from d6_controller import D6Controller, D6Error
+from d6_auth import AuthError, AuthStore
 
 
-BASE_DIR = Path(__file__).resolve().parent
+def _application_dir() -> Path:
+    """Return the source directory or installed executable directory."""
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = _application_dir()
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR)).resolve()
 PROFILE_DIR = Path(os.environ.get("D6_PROFILE_DIR", str(BASE_DIR / "profiles"))).resolve()
-FRONTEND_DIR = BASE_DIR / "dist"
+DATA_DIR = Path(os.environ.get("D6_DATA_DIR", str(BASE_DIR / "data"))).resolve()
+AUTH_PATH = DATA_DIR / "auth.json"
+FRONTEND_DIR = RESOURCE_DIR / "dist"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 STRUCTURE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9 ._-]*[A-Za-z0-9])?$")
 MAX_BODY_SIZE = 12 * 1024 * 1024
+MAX_BACKUP_SIZE = 64 * 1024 * 1024
+CONFIG_SCHEMA_VERSION = 1
+SESSION_COOKIE = "d6_session"
 ACTION_IMAGE_SIZE = (100, 100)
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
@@ -111,6 +132,176 @@ class _Input(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _InputUnion)]
 
 
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort), ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(value: str) -> _GUID:
+    parsed = uuid.UUID(value)
+    return _GUID(parsed.time_low, parsed.time_mid, parsed.time_hi_version, (ctypes.c_ubyte * 8)(*parsed.bytes[8:]))
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        # ctypes.wintypes does not expose every Win32 handle alias on every
+        # supported Python version. They are all pointer-sized handles here.
+        ("hInstance", wintypes.HANDLE),
+        ("hIcon", wintypes.HANDLE),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HANDLE),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class _POWERBROADCAST_SETTING(ctypes.Structure):
+    _fields_ = [
+        ("PowerSetting", _GUID),
+        ("DataLength", wintypes.DWORD),
+        ("Data", ctypes.c_ubyte * 1),
+    ]
+
+
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND = 0x0004
+PBT_APMRESUMEAUTOMATIC = 0x0012
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_POWERSETTINGCHANGE = 0x8013
+DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+GUID_CONSOLE_DISPLAY_STATE = _guid("6FE69556-704A-47A0-8F24-C28D936FDA47")
+
+
+class _WindowsPowerMonitor:
+    """Receive Windows suspend/resume and console-display power changes."""
+
+    def __init__(self, on_suspend, on_resume, on_display_off, on_display_on):
+        self.on_suspend = on_suspend
+        self.on_resume = on_resume
+        self.on_display_off = on_display_off
+        self.on_display_on = on_display_on
+        self.stop_event = threading.Event()
+        self.ready_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.hwnd = None
+        self._wndproc = None
+        self._class_name: str | None = None
+        self._power_notification = None
+
+    def start(self) -> None:
+        if os.name != "nt":
+            return
+        self.thread = threading.Thread(target=self._run, name="d6-power-monitor", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.hwnd:
+            try:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+                user32.PostMessageW.restype = wintypes.BOOL
+                user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+            except OSError:
+                pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        wndproc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        class_name = f"RidgePathD6Power-{os.getpid()}-{id(self)}"
+        self._class_name = class_name
+
+        def wndproc(hwnd, message, wparam, lparam):
+            if message == WM_POWERBROADCAST:
+                if wparam == PBT_APMSUSPEND:
+                    self.on_suspend()
+                elif wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                    self.on_resume()
+                elif wparam == PBT_POWERSETTINGCHANGE and lparam:
+                    setting = ctypes.cast(lparam, ctypes.POINTER(_POWERBROADCAST_SETTING)).contents
+                    if bytes(setting.PowerSetting.Data4) == bytes(GUID_CONSOLE_DISPLAY_STATE.Data4) and setting.PowerSetting.Data1 == GUID_CONSOLE_DISPLAY_STATE.Data1 and setting.PowerSetting.Data2 == GUID_CONSOLE_DISPLAY_STATE.Data2 and setting.PowerSetting.Data3 == GUID_CONSOLE_DISPLAY_STATE.Data3:
+                        if setting.DataLength and setting.Data[0] == 0:
+                            self.on_display_off()
+                        elif setting.DataLength and setting.Data[0] in (1, 2):
+                            self.on_display_on()
+                return 1
+            if message == WM_CLOSE:
+                user32.DestroyWindow(hwnd)
+                return 0
+            if message == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+        self._wndproc = wndproc_type(wndproc)
+        instance = kernel32.GetModuleHandleW(None)
+        window_class = _WNDCLASSW()
+        window_class.lpfnWndProc = ctypes.cast(self._wndproc, ctypes.c_void_p)
+        window_class.hInstance = instance
+        window_class.lpszClassName = class_name
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.RegisterPowerSettingNotification.argtypes = [wintypes.HWND, ctypes.POINTER(_GUID), wintypes.DWORD]
+        user32.RegisterPowerSettingNotification.restype = wintypes.HANDLE
+        user32.UnregisterPowerSettingNotification.argtypes = [wintypes.HANDLE]
+        user32.UnregisterPowerSettingNotification.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+
+        if not user32.RegisterClassW(ctypes.byref(window_class)):
+            self.ready_event.set()
+            return
+        try:
+            self.hwnd = user32.CreateWindowExW(0, class_name, "RidgePath D6 Power Monitor", 0, 0, 0, 0, 0, None, None, instance, None)
+            if not self.hwnd:
+                return
+            self._power_notification = user32.RegisterPowerSettingNotification(self.hwnd, ctypes.byref(GUID_CONSOLE_DISPLAY_STATE), DEVICE_NOTIFY_WINDOW_HANDLE)
+            self.ready_event.set()
+            message = wintypes.MSG()
+            while not self.stop_event.is_set():
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        finally:
+            if self._power_notification:
+                user32.UnregisterPowerSettingNotification(self._power_notification)
+            if self.hwnd:
+                user32.DestroyWindow(self.hwnd)
+                self.hwnd = None
+            user32.UnregisterClassW(class_name, instance)
+
+
+CLSID_MMDEVICE_ENUMERATOR = _guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
+IID_IMMDEVICE_ENUMERATOR = _guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
+IID_IAUDIO_ENDPOINT_VOLUME = _guid("5CDF2C82-841E-4546-9722-0CF74078229A")
+CLSCTX_INPROC_SERVER = 1
+E_CAPTURE = 1
+E_CONSOLE = 0
+
+
+class RequestDenied(PermissionError):
+    """Raised when a request is not from the local configurator boundary."""
+
+
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 SW_RESTORE = 9
 BUILTIN_ACTION_LABELS = {
@@ -120,8 +311,10 @@ BUILTIN_ACTION_LABELS = {
     "next_page": "Next",
     "page_indicator": "Page",
     "sleep": "Sleep",
+    "mic_mute": "Mic",
 }
 BUILTIN_ACTION_TYPES = set(BUILTIN_ACTION_LABELS)
+RENDERED_ACTION_TYPES = BUILTIN_ACTION_TYPES | {"website", "launch", "open_folder", "navigate", "hotkey"}
 
 
 def _powershell_path_literal(path: Path) -> str:
@@ -219,6 +412,89 @@ def bring_window_to_foreground(hwnd: int) -> bool:
             user32.AttachThreadInput(foreground_thread, target_thread, False)
 
 
+def foreground_window() -> int | None:
+    if os.name != "nt":
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    return int(user32.GetForegroundWindow() or 0) or None
+
+
+def find_window_for_process(pid: int) -> int | None:
+    """Return a visible top-level window owned by *pid*, if one exists."""
+
+    if os.name != "nt" or not pid:
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        if owner_pid.value == pid:
+            found.append(int(hwnd))
+            return False
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return found[0] if found else None
+
+
+def process_ids_by_name(name: str) -> list[int]:
+    if os.name != "nt":
+        return []
+    try:
+        result = subprocess.run(
+            ["tasklist.exe", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    values: list[int] = []
+    for line in result.stdout.splitlines():
+        fields = [field.strip('"') for field in line.split(",")]
+        if len(fields) < 2 or fields[0].lower() != name.lower():
+            continue
+        try:
+            values.append(int(fields[1]))
+        except ValueError:
+            continue
+    return values
+
+
+def launch_target(command: str, *, process_name: str | None = None, timeout: float = 4.0) -> dict[str, Any]:
+    """Launch a visible Windows target and make a bounded foreground attempt."""
+
+    if not command.strip():
+        raise ValueError("launch action has no command")
+    before = set(process_ids_by_name(process_name)) if process_name else set()
+    process = subprocess.Popen(command, cwd=str(BASE_DIR), shell=True, creationflags=CREATE_NO_WINDOW)
+    deadline = time.monotonic() + max(0.5, timeout)
+    hwnd = find_window_for_process(process.pid)
+    if hwnd is None and process_name:
+        while time.monotonic() < deadline:
+            candidates = [pid for pid in process_ids_by_name(process_name) if pid not in before]
+            for candidate in candidates or process_ids_by_name(process_name):
+                hwnd = find_window_for_process(candidate)
+                if hwnd:
+                    break
+            if hwnd:
+                break
+            time.sleep(0.15)
+    focused = bring_window_to_foreground(hwnd) if hwnd else False
+    return {"pid": process.pid, "hwnd": hwnd, "focused": focused}
+
+
 def focus_explorer_path(path: str | Path, command: str | None = None, *, timeout: float = 4.0) -> bool:
     """Open/reuse an Explorer folder and activate its window in the foreground."""
 
@@ -242,18 +518,63 @@ def focus_explorer_path(path: str | Path, command: str | None = None, *, timeout
     return bring_window_to_foreground(hwnd) if hwnd is not None else False
 
 
-def open_website(url: str) -> None:
+def open_website(url: str) -> bool:
     """Open an explicitly web-only action in the user's default browser."""
 
     value = str(url or "").strip()
     parsed = urlparse(value)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("website actions require an http:// or https:// URL")
+    before = foreground_window()
     startfile = getattr(os, "startfile", None)
     if startfile:
         startfile(value)
     else:
         subprocess.Popen(["xdg-open", value], creationflags=CREATE_NO_WINDOW)
+    if os.name != "nt":
+        return True
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        current = foreground_window()
+        if current and current != before:
+            return bring_window_to_foreground(current)
+        time.sleep(0.1)
+    current = foreground_window()
+    return bool(current and bring_window_to_foreground(current))
+
+
+def select_folder_native() -> str | None:
+    """Open a real Windows folder picker without flashing a console window."""
+
+    if os.name != "nt":
+        raise ValueError("native folder selection is only available on Windows")
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Choose a folder for the D6 action'
+$dialog.ShowNewFolderButton = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::WriteLine([System.IO.Path]::GetFullPath($dialog.SelectedPath))
+}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-WindowStyle", "Hidden", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("native folder dialog could not be opened") from exc
+    value = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "")
+    if not value:
+        return None
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        raise ValueError("folder dialog returned an inaccessible folder")
+    return str(path)
 
 
 def valid_name(value: str) -> bool:
@@ -287,6 +608,8 @@ def action_label(action: dict[str, Any] | None, *, page_index: int | None = None
         return str(action.get("page") or action.get("scene") or "Navigate")
     if action_type == "launch":
         return str(action.get("command") or "Launch")
+    if action_type == "open_folder":
+        return str(action.get("path") or "Folder")
     if action_type == "website":
         return "Website"
     if action_type == "page_indicator" and page_index is not None and page_total:
@@ -306,51 +629,273 @@ def action_font_size(action: dict[str, Any] | None, default: int = 16) -> int:
     return max(8, min(28, value))
 
 
-def _action_image_path(profile_dir: Path, profile_name: str, scene: str, page: str, key: int, action: dict[str, Any]) -> Path:
-    digest = hashlib.sha1(json.dumps(action, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+def _action_image_path(
+    profile_dir: Path,
+    profile_name: str,
+    scene: str,
+    page: str,
+    key: int,
+    action: dict[str, Any],
+    *,
+    page_index: int = 0,
+    page_total: int = 1,
+) -> Path:
+    digest = hashlib.sha1(
+        json.dumps(
+            {"action": action, "profile": profile_name, "scene": scene, "page": page, "key": key, "page_index": page_index, "page_total": page_total},
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
     path = profile_dir / "assets" / f"action-{profile_name}-{digest}-key-{key}.jpg"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def render_action_image(path: Path, label: str, font_size: int = 16) -> Path:
+def _fit_font(draw: Any, font_path: Path | None, text: str, requested_size: int, box: tuple[int, int, int, int]) -> tuple[Any, list[str]]:
+    from PIL import ImageFont
+
+    left, top, right, bottom = box
+    for size in range(max(8, min(28, int(requested_size))), 7, -1):
+        font = ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
+        lines: list[str] = []
+        for paragraph in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if not paragraph:
+                lines.append("")
+                continue
+            current = ""
+            for word in paragraph.split():
+                candidate = word if not current else f"{current} {word}"
+                if draw.textbbox((0, 0), candidate, font=font)[2] <= right - left:
+                    current = candidate
+                    continue
+                if current:
+                    lines.append(current)
+                current = ""
+                while word and draw.textbbox((0, 0), word, font=font)[2] > right - left:
+                    chunk = ""
+                    for character in word:
+                        if draw.textbbox((0, 0), chunk + character, font=font)[2] > right - left:
+                            break
+                        chunk += character
+                    if not chunk:
+                        chunk = word[0]
+                    lines.append(chunk)
+                    word = word[len(chunk):]
+                current = word
+            if current:
+                lines.append(current)
+        lines = lines or ["Action"]
+        widths = [draw.textbbox((0, 0), line, font=font)[2] for line in lines]
+        height = sum(draw.textbbox((0, 0), line, font=font)[3] for line in lines) + max(0, len(lines) - 1) * 2
+        if max(widths, default=0) <= right - left and height <= bottom - top:
+            return font, lines
+    return (ImageFont.truetype(str(font_path), 8) if font_path else ImageFont.load_default()), [line[:18] for line in str(text).splitlines() or ["Action"]]
+
+
+def _draw_fitted_text(
+    draw: Any,
+    font: Any,
+    lines: list[str],
+    box: tuple[int, int, int, int],
+    fill: tuple[int, int, int],
+    shadow: tuple[int, int, int] | None = None,
+) -> None:
+    left, top, right, bottom = box
+    heights = [draw.textbbox((0, 0), line, font=font)[3] for line in lines]
+    total_height = sum(heights) + max(0, len(lines) - 1) * 2
+    y = top + max(0, (bottom - top - total_height) / 2)
+    for line, height in zip(lines, heights):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        x = left + max(0, (right - left - (bbox[2] - bbox[0])) / 2)
+        if shadow:
+            draw.text((x + 1, y + 1), line, fill=shadow, font=font)
+        draw.text((x, y), line, fill=fill, font=font)
+        y += height + 2
+
+
+def render_action_image(path: Path, label: str, font_size: int = 16, action_type: str | None = None, *, muted: bool = False) -> Path:
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as exc:
         raise D6Error("Pillow is required for LCD action labels") from exc
 
-    image = Image.new("RGB", ACTION_IMAGE_SIZE, (10, 18, 29))
+    image = Image.new("RGB", ACTION_IMAGE_SIZE, (7, 22, 34))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((2, 2, 97, 97), radius=10, outline=(45, 190, 255), width=3)
-    draw.line((15, 19, 85, 19), fill=(45, 190, 255), width=2)
+    outline = (53, 196, 190)
+    accent = (45, 155, 216)
+    light = (235, 250, 249)
     font_candidates = [
         Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeuib.ttf",
         Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arialbd.ttf",
     ]
     font_path = next((candidate for candidate in font_candidates if candidate.is_file()), None)
-    words = textwrap.wrap(label, width=12, break_long_words=True) or ["Action"]
-    chosen_font = None
-    chosen_lines = words
-    requested_size = max(8, min(28, int(font_size)))
-    for size in range(requested_size, 7, -1):
-        font = ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
-        lines = textwrap.wrap(label, width=max(5, int(120 / max(size, 1))), break_long_words=True) or ["Action"]
-        widths = [draw.textbbox((0, 0), line, font=font)[2] for line in lines]
-        height = sum(draw.textbbox((0, 0), line, font=font)[3] for line in lines) + max(0, len(lines) - 1) * 2
-        if max(widths, default=0) <= 82 and height <= 67:
-            chosen_font, chosen_lines = font, lines
-            break
-    chosen_font = chosen_font or (ImageFont.truetype(str(font_path), 9) if font_path else ImageFont.load_default())
-    heights = [draw.textbbox((0, 0), line, font=chosen_font)[3] for line in chosen_lines]
-    total_height = sum(heights) + max(0, len(chosen_lines) - 1) * 2
-    y = 52 - total_height / 2
-    for line, height in zip(chosen_lines, heights):
-        bbox = draw.textbbox((0, 0), line, font=chosen_font)
-        x = (100 - (bbox[2] - bbox[0])) / 2
-        draw.text((x, y), line, fill=(236, 249, 255), font=chosen_font)
-        y += height + 2
+    action_type = (action_type or "label").lower()
+    if action_type != "mic_mute":
+        draw.rounded_rectangle((2, 2, 97, 97), radius=10, outline=outline, width=3)
+        draw.line((15, 17, 85, 17), fill=accent, width=2)
+    if action_type == "open_folder":
+        folder = [(13, 38), (13, 30), (35, 30), (41, 35), (86, 35), (86, 80), (13, 80)]
+        draw.polygon(folder, fill=(11, 91, 119), outline=outline)
+        draw.line((17, 47, 82, 47), fill=(99, 220, 205), width=2)
+        text_box = (17, 49, 82, 79)
+    else:
+        icon_y = 45
+        if action_type == "back":
+            draw.polygon([(18, icon_y), (43, 24), (43, 34), (71, 34), (82, 45), (71, 56), (43, 56), (43, 66)], fill=accent)
+            text_box = (14, 68, 86, 92)
+        elif action_type == "home":
+            draw.polygon([(18, 43), (50, 21), (82, 43), (75, 43), (75, 70), (25, 70), (25, 43)], fill=accent)
+            draw.rectangle((43, 51, 57, 70), fill=(7, 22, 34), outline=outline)
+            text_box = (14, 72, 86, 93)
+        elif action_type in {"previous_page", "next_page"}:
+            direction = -1 if action_type == "previous_page" else 1
+            if direction < 0:
+                points = [(67, 24), (35, 45), (67, 66), (67, 54), (84, 54), (84, 36), (67, 36)]
+            else:
+                points = [(33, 24), (65, 45), (33, 66), (33, 54), (16, 54), (16, 36), (33, 36)]
+            draw.polygon(points, fill=accent)
+            text_box = (14, 70, 86, 93)
+        elif action_type == "page_indicator":
+            draw.rounded_rectangle((20, 26, 80, 61), radius=6, outline=accent, width=3)
+            draw.line((29, 34, 71, 34), fill=outline, width=2)
+            draw.ellipse((31, 45, 39, 53), fill=outline)
+            draw.ellipse((46, 45, 54, 53), fill=outline)
+            draw.ellipse((61, 45, 69, 53), fill=outline)
+            text_box = (12, 66, 88, 93)
+        elif action_type == "sleep":
+            draw.ellipse((30, 23, 70, 63), fill=accent)
+            draw.ellipse((42, 17, 76, 52), fill=(7, 22, 34))
+            draw.line((24, 70, 76, 70), fill=outline, width=3)
+            text_box = (12, 74, 88, 93)
+        elif action_type == "mic_mute":
+            mic_fill = (206, 57, 67) if muted else accent
+            mic_outline = (255, 147, 153) if muted else outline
+            draw.rounded_rectangle((37, 22, 63, 56), radius=13, fill=mic_fill, outline=mic_outline, width=2)
+            draw.arc((25, 34, 75, 72), 0, 180, fill=mic_outline, width=4)
+            draw.line((50, 72, 50, 80), fill=mic_outline, width=4)
+            draw.line((38, 81, 62, 81), fill=mic_outline, width=4)
+            if muted:
+                draw.line((27, 25, 73, 71), fill=(255, 203, 207), width=4)
+            text_box = (12, 82, 88, 98)
+        elif action_type == "website":
+            draw.ellipse((25, 24, 75, 68), outline=accent, width=4)
+            draw.line((25, 46, 75, 46), fill=outline, width=2)
+            draw.arc((39, 24, 61, 68), 90, 270, fill=outline, width=2)
+            text_box = (12, 72, 88, 93)
+        elif action_type in {"launch", "open_app", "codex"}:
+            draw.rounded_rectangle((24, 26, 76, 66), radius=5, outline=accent, width=4)
+            draw.line((35, 76, 65, 76), fill=outline, width=3)
+            draw.line((50, 66, 50, 76), fill=outline, width=3)
+            text_box = (12, 79, 88, 94)
+        else:
+            draw.rounded_rectangle((18, 28, 82, 64), radius=6, outline=accent, width=3)
+            text_box = (12, 68, 88, 93)
+    display_label = "" if action_type == "mic_mute" and label in {"", BUILTIN_ACTION_LABELS["mic_mute"]} else label or BUILTIN_ACTION_LABELS.get(action_type, "Action")
+    if display_label:
+        chosen_font, chosen_lines = _fit_font(draw, font_path, display_label, font_size, text_box)
+        _draw_fitted_text(draw, chosen_font, chosen_lines, text_box, light)
     image.save(path, format="JPEG", quality=95, optimize=False)
     return path
+
+
+def render_labeled_custom_image(source: Path, destination: Path, label: str, font_size: int, action_type: str) -> Path:
+    """Preserve custom artwork while adding the configured LCD label."""
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise D6Error("Pillow is required for LCD labels") from exc
+
+    image = Image.open(source).convert("RGB").resize(ACTION_IMAGE_SIZE, Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(image)
+    font_candidates = [
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeuib.ttf",
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arialbd.ttf",
+    ]
+    font_path = next((candidate for candidate in font_candidates if candidate.is_file()), None)
+    text_box = (8, 68, 92, 98) if action_type == "open_folder" else (12, 72, 88, 94)
+    chosen_font, chosen_lines = _fit_font(draw, font_path, label, font_size, text_box)
+    _draw_fitted_text(draw, chosen_font, chosen_lines, text_box, (235, 246, 255), shadow=(3, 12, 28))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image.save(destination, format="JPEG", quality=95, optimize=False)
+    return destination
+
+
+def microphone_artwork_path(profile_dir: Path, muted: bool) -> Path | None:
+    """Return the polished state artwork when it is installed with the profile."""
+
+    candidate = profile_dir / "assets" / ("mic-muted.png" if muted else "mic.png")
+    return candidate if candidate.is_file() else None
+
+
+def _com_call(interface: ctypes.c_void_p, index: int, restype: Any, argtypes: list[Any], *args: Any) -> Any:
+    vtable = ctypes.cast(interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    function = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtable[index])
+    return function(interface, *args)
+
+
+def _com_release(interface: ctypes.c_void_p | None) -> None:
+    if interface:
+        _com_call(interface, 2, wintypes.ULONG, [],)
+
+
+def _with_microphone_endpoint(callback: Any) -> Any:
+    if os.name != "nt":
+        raise D6Error("microphone mute is only supported on Windows")
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoInitialize.restype = wintypes.LONG
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+    ole32.CoCreateInstance.argtypes = [ctypes.POINTER(_GUID), ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+    ole32.CoCreateInstance.restype = wintypes.LONG
+    ole32.CoInitialize(None)
+    enumerator = ctypes.c_void_p()
+    device = ctypes.c_void_p()
+    volume = ctypes.c_void_p()
+    try:
+        result = ole32.CoCreateInstance(ctypes.byref(CLSID_MMDEVICE_ENUMERATOR), None, CLSCTX_INPROC_SERVER, ctypes.byref(IID_IMMDEVICE_ENUMERATOR), ctypes.byref(enumerator))
+        if result < 0:
+            raise D6Error(f"could not initialize the Windows audio device enumerator (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        result = _com_call(enumerator, 4, wintypes.LONG, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)], E_CAPTURE, E_CONSOLE, ctypes.byref(device))
+        if result < 0:
+            raise D6Error(f"could not find the default microphone (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        result = _com_call(device, 3, wintypes.LONG, [ctypes.POINTER(_GUID), wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(IID_IAUDIO_ENDPOINT_VOLUME), CLSCTX_INPROC_SERVER, None, ctypes.byref(volume))
+        if result < 0:
+            raise D6Error(f"could not access the default microphone volume endpoint (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        return callback(volume)
+    finally:
+        _com_release(volume)
+        _com_release(device)
+        _com_release(enumerator)
+        ole32.CoUninitialize()
+
+
+def get_microphone_mute() -> bool:
+    def read_state(volume: ctypes.c_void_p) -> bool:
+        muted = wintypes.BOOL()
+        result = _com_call(volume, 15, wintypes.LONG, [ctypes.POINTER(wintypes.BOOL)], ctypes.byref(muted))
+        if result < 0:
+            raise D6Error(f"could not read microphone mute state (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        return bool(muted.value)
+
+    return bool(_with_microphone_endpoint(read_state))
+
+
+def toggle_microphone_mute() -> bool:
+    def toggle_state(volume: ctypes.c_void_p) -> bool:
+        muted = wintypes.BOOL()
+        result = _com_call(volume, 15, wintypes.LONG, [ctypes.POINTER(wintypes.BOOL)], ctypes.byref(muted))
+        if result < 0:
+            raise D6Error(f"could not read microphone mute state (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        next_state = not bool(muted.value)
+        result = _com_call(volume, 14, wintypes.LONG, [wintypes.BOOL, ctypes.c_void_p], wintypes.BOOL(next_state), None)
+        if result < 0:
+            raise D6Error(f"could not change microphone mute state (HRESULT 0x{result & 0xFFFFFFFF:08X})")
+        return next_state
+
+    return bool(_with_microphone_endpoint(toggle_state))
 
 
 def _key_vk(value: str) -> int | None:
@@ -418,16 +963,65 @@ def profile_path(name: str, profile_dir: Path = PROFILE_DIR) -> Path:
     return profile_dir / f"{name}.json"
 
 
+def normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """Normalize legacy actions in memory without discarding unknown fields."""
+
+    scenes = profile.get("scenes") if isinstance(profile, dict) else None
+    if not isinstance(scenes, dict):
+        return profile
+    for scene_data in scenes.values():
+        pages = scene_data.get("pages") if isinstance(scene_data, dict) else None
+        if not isinstance(pages, dict):
+            continue
+        for page_data in pages.values():
+            keys = page_data.get("keys") if isinstance(page_data, dict) else None
+            if not isinstance(keys, dict):
+                continue
+            for definition in keys.values():
+                if not isinstance(definition, dict) or not isinstance(definition.get("action"), dict):
+                    continue
+                action = definition["action"]
+                if str(action.get("type") or "").lower() != "launch" or not str(action.get("focus_path") or "").strip():
+                    continue
+                command = str(action.get("command") or "").strip().lower()
+                if command and not command.startswith("explorer"):
+                    continue
+                definition["action"] = {
+                    "type": "open_folder",
+                    "path": str(action.get("focus_path")).strip(),
+                    **({"label": action["label"]} if action.get("label") else {}),
+                    **({"font_size": action["font_size"]} if action.get("font_size") is not None else {}),
+                }
+    return profile
+
+
 def load_profile(name: str, profile_dir: Path = PROFILE_DIR) -> dict[str, Any]:
-    return json.loads(profile_path(name, profile_dir).read_text(encoding="utf-8"))
+    return normalize_profile(json.loads(profile_path(name, profile_dir).read_text(encoding="utf-8")))
 
 
 def save_profile(name: str, profile: dict[str, Any], profile_dir: Path = PROFILE_DIR) -> None:
     profile_dir.mkdir(parents=True, exist_ok=True)
     target = profile_path(name, profile_dir)
     temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(normalize_profile(profile), indent=2) + "\n", encoding="utf-8")
     temporary.replace(target)
+
+
+def ensure_default_profile(profile_dir: Path = PROFILE_DIR) -> None:
+    """Create the first local profile from the public template if needed."""
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    template = RESOURCE_DIR / "profile.example.json"
+    if not any(profile_dir.glob("*.json")) and template.is_file():
+        shutil.copyfile(template, profile_dir / "default.json")
+
+    bundled_assets = RESOURCE_DIR / "profiles" / "assets"
+    user_assets = profile_dir / "assets"
+    if bundled_assets.is_dir() and bundled_assets.resolve() != user_assets.resolve():
+        user_assets.mkdir(parents=True, exist_ok=True)
+        for asset in bundled_assets.iterdir():
+            if asset.is_file() and not (user_assets / asset.name).exists():
+                shutil.copyfile(asset, user_assets / asset.name)
 
 
 def scene_names(profile: dict[str, Any]) -> list[str]:
@@ -493,15 +1087,24 @@ def add_structure(profile: dict[str, Any], kind: str, name: str, parent: str | N
 class D6Service:
     """Own one controller handle and serialize all device writes."""
 
-    def __init__(self, profile_dir: Path = PROFILE_DIR):
+    def __init__(self, profile_dir: Path = PROFILE_DIR, data_dir: Path = DATA_DIR):
         self.profile_dir = profile_dir
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.auth = AuthStore(self.data_dir / "auth.json")
         self.controller: D6Controller | None = None
         self.controller_lock = threading.RLock()
         self.operation_lock = threading.RLock()
         self.stop_event = threading.Event()
         self.listener_thread: threading.Thread | None = None
         self.heartbeat_thread: threading.Thread | None = None
+        self.power_monitor = _WindowsPowerMonitor(
+            self._handle_system_suspend,
+            self._handle_system_resume,
+            self._handle_display_off,
+            self._handle_display_on,
+        )
         self.subscribers: set[queue.Queue[dict[str, Any]]] = set()
         self.subscribers_lock = threading.Lock()
         self.recent_events: deque[dict[str, Any]] = deque(maxlen=100)
@@ -517,6 +1120,8 @@ class D6Service:
         self.ignored_report_count = 0
         self.last_report_hex: str | None = None
         self.transport = os.environ.get("D6_TRANSPORT", "auto").strip().lower()
+        self.power_state_lock = threading.RLock()
+        self.restful_reasons: set[str] = set()
 
     def start(self) -> None:
         self.stop_event.clear()
@@ -524,9 +1129,11 @@ class D6Service:
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self.listener_thread.start()
         self.heartbeat_thread.start()
+        self.power_monitor.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.power_monitor.stop()
         with self.controller_lock:
             controller, self.controller = self.controller, None
         if controller:
@@ -559,6 +1166,9 @@ class D6Service:
         return self.controller
 
     def _current_controller(self) -> D6Controller | None:
+        with self.power_state_lock:
+            if self.restful_reasons:
+                return None
         with self.controller_lock:
             controller = self.controller
         return controller or self._connect()
@@ -569,8 +1179,69 @@ class D6Service:
                 self.controller = None
         controller.close()
 
+    def _handle_system_suspend(self) -> None:
+        self._enter_restful_state("system")
+
+    def _handle_system_resume(self) -> None:
+        self._leave_restful_state("system")
+
+    def _handle_display_off(self) -> None:
+        self._enter_restful_state("display")
+
+    def _handle_display_on(self) -> None:
+        self._leave_restful_state("display")
+
+    def _enter_restful_state(self, reason: str) -> None:
+        with self.power_state_lock:
+            if reason in self.restful_reasons:
+                return
+            was_active = not self.restful_reasons
+            self.restful_reasons.add(reason)
+        if not was_active:
+            return
+        with self.controller_lock:
+            controller = self.controller
+        if controller is not None:
+            try:
+                with self.operation_lock:
+                    controller.sleep_screen()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self._disconnect(controller)
+        self.publish_event({"type": "power", "state": "resting", "reason": reason, "timestamp": time.time()})
+
+    def _leave_restful_state(self, reason: str) -> None:
+        with self.power_state_lock:
+            if reason not in self.restful_reasons:
+                return
+            self.restful_reasons.discard(reason)
+            still_resting = bool(self.restful_reasons)
+        if still_resting:
+            return
+        controller = self._current_controller()
+        if controller is None:
+            self.publish_event({"type": "power", "state": "awake", "reason": reason, "timestamp": time.time()})
+            return
+        try:
+            with self.operation_lock:
+                controller.wake_screen()
+                controller.heartbeat()
+            profile_name, scene, page = self._active_context()
+            profile = load_profile(profile_name, self.profile_dir)
+            self.apply(profile, scene, page, profile_name=profile_name)
+            self.publish_event({"type": "power", "state": "awake", "reason": reason, "timestamp": time.time()})
+        except Exception as exc:
+            self.last_error = str(exc)
+            self._disconnect(controller)
+            self.publish_event({"type": "error", "message": f"D6 resume failed: {exc}", "timestamp": time.time()})
+
     def _listener_loop(self) -> None:
         while not self.stop_event.is_set():
+            with self.power_state_lock:
+                resting = bool(self.restful_reasons)
+            if resting:
+                self.stop_event.wait(0.5)
+                continue
             controller = self._current_controller()
             if controller is None:
                 self.stop_event.wait(1)
@@ -651,6 +1322,11 @@ class D6Service:
             "transport": transport,
             "transport_note": transport_note,
             "last_error": self.last_error,
+            "power": {
+                "resting": bool(self.restful_reasons),
+                "reasons": sorted(self.restful_reasons),
+                "sync_enabled": os.name == "nt",
+            },
             "input": {
                 "reports": self.report_count,
                 "decoded_events": self.decoded_event_count,
@@ -755,8 +1431,8 @@ class D6Service:
             )
         elif action_type == "website":
             with self.operation_lock:
-                open_website(str(action.get("url") or ""))
-            self.publish_event({"type": "action", "key": key, "action": "website", "label": action_label(action), "timestamp": time.time()})
+                focused = open_website(str(action.get("url") or ""))
+            self.publish_event({"type": "action", "key": key, "action": "website", "label": action_label(action), "focused": focused, "timestamp": time.time()})
         elif action_type == "sleep":
             controller = self._current_controller()
             if controller is None:
@@ -764,21 +1440,37 @@ class D6Service:
             with self.operation_lock:
                 controller.sleep_screen()
             self.publish_event({"type": "action", "key": key, "action": "sleep", "timestamp": time.time()})
+        elif action_type == "mic_mute":
+            with self.operation_lock:
+                muted = toggle_microphone_mute()
+                applied = self.apply(profile, scene, page, profile_name=profile_name)
+            self.publish_event({"type": "action", "key": key, "action": "mic_mute", "muted": muted, "count": applied, "timestamp": time.time()})
+        elif action_type == "open_folder":
+            folder = str(action.get("path") or "").strip()
+            if not folder:
+                raise ValueError("open folder action has no folder path")
+            focused = focus_explorer_path(folder, timeout=4.0)
+            self.publish_event({"type": "action", "key": key, "action": "open_folder", "label": action_label(action), "focused": focused, "timestamp": time.time()})
         elif action_type == "launch":
             command = str(action.get("command") or "").strip()
             focus_path = str(action.get("focus_path") or "").strip()
             if not command and not focus_path:
                 raise ValueError("launch action has no command")
             if focus_path:
-                focus_explorer_path(focus_path, command or None)
+                focused = focus_explorer_path(focus_path, command or None)
             else:
-                subprocess.Popen(command, cwd=str(BASE_DIR), shell=True, creationflags=CREATE_NO_WINDOW)
+                configured_process = str(action.get("process_name") or "").strip()
+                first_token = command.split(maxsplit=1)[0].strip('"') if command else ""
+                inferred_process = Path(first_token).name if first_token.lower().endswith((".exe", ".com")) else None
+                result = launch_target(command, process_name=configured_process or inferred_process)
+                focused = result["focused"]
             self.publish_event(
                 {
                     "type": "action",
                     "key": key,
                     "action": "launch",
                     "label": action_label(action),
+                    "focused": focused,
                     "timestamp": time.time(),
                 }
             )
@@ -808,36 +1500,51 @@ class D6Service:
                 controller.set_brightness(int(brightness))
             count = 0
             if isinstance(keys, dict):
+                microphone_muted: bool | None = None
                 for raw_key, definition in sorted(keys.items(), key=lambda item: int(item[0])):
                     if not isinstance(definition, dict):
                         continue
                     action = definition.get("action") if isinstance(definition.get("action"), dict) else None
                     action_type = str(action.get("type") or "").lower() if action else ""
-                    if action and action_type == "hotkey":
-                        image_path = render_action_image(
+                    if action and action_type == "open_folder" and definition.get("image") and action.get("label"):
+                        source_path = (self.profile_dir / str(definition["image"])).resolve()
+                        if self.profile_dir not in source_path.parents or not source_path.is_file():
+                            raise FileNotFoundError(f"custom folder artwork not found: {definition['image']}")
+                        image_path = render_labeled_custom_image(
+                            source_path,
                             _action_image_path(
                                 self.profile_dir,
                                 profile_name or "profile",
                                 selected_scene,
                                 selected_page,
                                 int(raw_key),
-                                action,
-                            ),
-                            action_label(action),
-                            action_font_size(action),
-                        )
-                    elif action and (action_type in BUILTIN_ACTION_TYPES or action_type in {"website", "launch"}) and not definition.get("image"):
-                        image_path = render_action_image(
-                            _action_image_path(
-                                self.profile_dir,
-                                profile_name or "profile",
-                                selected_scene,
-                                selected_page,
-                                int(raw_key),
-                                action,
+                                {**action, "_custom_image": str(definition["image"])},
+                                page_index=selected_page_index,
+                                page_total=len(available_pages),
                             ),
                             action_label(action, page_index=selected_page_index, page_total=len(available_pages)),
                             action_font_size(action),
+                            action_type,
+                        )
+                    elif action and action_type in RENDERED_ACTION_TYPES and not definition.get("image"):
+                        if action_type == "mic_mute" and microphone_muted is None:
+                            microphone_muted = get_microphone_mute()
+                        mic_artwork = microphone_artwork_path(self.profile_dir, bool(microphone_muted)) if action_type == "mic_mute" else None
+                        image_path = mic_artwork or render_action_image(
+                            _action_image_path(
+                                self.profile_dir,
+                                profile_name or "profile",
+                                selected_scene,
+                                selected_page,
+                                int(raw_key),
+                                action,
+                                page_index=selected_page_index,
+                                page_total=len(available_pages),
+                            ),
+                            action_label(action, page_index=selected_page_index, page_total=len(available_pages)),
+                            action_font_size(action),
+                            action_type,
+                            muted=bool(microphone_muted),
                         )
                     elif definition.get("image"):
                         image_path = (self.profile_dir / definition["image"]).resolve()
@@ -870,6 +1577,117 @@ class D6Service:
             controller.refresh()
         self.publish_event({"type": "refresh", "timestamp": time.time()})
 
+    def export_config(self) -> bytes:
+        """Create a portable profile-and-artwork archive without auth state."""
+
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "manifest.json",
+                json.dumps(
+                    {
+                        "format": "d6config",
+                        "schema_version": CONFIG_SCHEMA_VERSION,
+                        "created_at": int(time.time()),
+                        "application": "RidgePath D6 Controller",
+                    },
+                    indent=2,
+                ),
+            )
+            for profile_path in sorted(self.profile_dir.glob("*.json")):
+                archive.writestr(f"profiles/{profile_path.name}", json.dumps(load_profile(profile_path.stem, self.profile_dir), indent=2))
+            assets = self.profile_dir / "assets"
+            if assets.is_dir():
+                for asset in sorted(path for path in assets.rglob("*") if path.is_file()):
+                    archive.write(asset, f"assets/{asset.relative_to(assets).as_posix()}")
+        return stream.getvalue()
+
+    def restore_config(self, payload: bytes) -> list[str]:
+        """Validate and restore a .d6config archive transactionally."""
+
+        if len(payload) > MAX_BACKUP_SIZE:
+            raise ValueError("configuration backup is too large")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=self.data_dir) as temporary:
+            stage = Path(temporary)
+            staged_profiles = stage / "profiles"
+            staged_assets = stage / "assets"
+            staged_profiles.mkdir()
+            staged_assets.mkdir()
+            try:
+                with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+                    infos = archive.infolist()
+                    if sum(info.file_size for info in infos) > MAX_BACKUP_SIZE:
+                        raise ValueError("configuration backup expands beyond the size limit")
+                    names = {info.filename for info in infos}
+                    if "manifest.json" not in names:
+                        raise ValueError("configuration backup is missing its manifest")
+                    manifest = json.loads(archive.read("manifest.json"))
+                    if manifest.get("format") != "d6config" or int(manifest.get("schema_version", -1)) != CONFIG_SCHEMA_VERSION:
+                        raise ValueError("unsupported configuration backup format")
+                    profile_names: list[str] = []
+                    for info in infos:
+                        name = info.filename.replace("\\", "/")
+                        if name.endswith("/") or name == "manifest.json":
+                            continue
+                        parts = name.split("/")
+                        if any(part in {"", ".", ".."} for part in parts) or name.startswith("/"):
+                            raise ValueError("configuration backup contains an unsafe path")
+                        if parts[0] == "profiles" and len(parts) == 2 and parts[1].endswith(".json"):
+                            profile_name = parts[1][:-5]
+                            if not valid_name(profile_name):
+                                raise ValueError("configuration backup contains an invalid profile name")
+                            profile = json.loads(archive.read(info))
+                            if not isinstance(profile, dict):
+                                raise ValueError("profile backup must contain an object")
+                            json.dumps(profile)
+                            (staged_profiles / parts[1]).write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+                            profile_names.append(profile_name)
+                        elif parts[0] == "assets" and len(parts) >= 2:
+                            target = staged_assets.joinpath(*parts[1:]).resolve()
+                            if staged_assets.resolve() not in target.parents:
+                                raise ValueError("configuration backup contains an unsafe asset path")
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(archive.read(info))
+                        else:
+                            raise ValueError("configuration backup contains an unexpected file")
+            except zipfile.BadZipFile as exc:
+                raise ValueError("configuration backup is not a valid archive") from exc
+            if not profile_names:
+                raise ValueError("configuration backup contains no profiles")
+            for profile_name in profile_names:
+                load_profile(profile_name, staged_profiles)
+
+            rollback = stage / "rollback"
+            rollback_profiles = rollback / "profiles"
+            rollback_assets = rollback / "assets"
+            rollback_profiles.mkdir(parents=True)
+            for existing in self.profile_dir.glob("*.json"):
+                shutil.copy2(existing, rollback_profiles / existing.name)
+            if (self.profile_dir / "assets").is_dir():
+                shutil.copytree(self.profile_dir / "assets", rollback_assets)
+            try:
+                for existing in self.profile_dir.glob("*.json"):
+                    existing.unlink()
+                for staged in staged_profiles.glob("*.json"):
+                    shutil.copy2(staged, self.profile_dir / staged.name)
+                current_assets = self.profile_dir / "assets"
+                if current_assets.exists():
+                    shutil.rmtree(current_assets)
+                shutil.copytree(staged_assets, current_assets)
+            except Exception:
+                for existing in self.profile_dir.glob("*.json"):
+                    existing.unlink()
+                for old in rollback_profiles.glob("*.json"):
+                    shutil.copy2(old, self.profile_dir / old.name)
+                current_assets = self.profile_dir / "assets"
+                if current_assets.exists():
+                    shutil.rmtree(current_assets)
+                if rollback_assets.exists():
+                    shutil.copytree(rollback_assets, current_assets)
+                raise
+            return sorted(profile_names)
+
 
 def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
     body = json.dumps(payload).encode("utf-8")
@@ -896,21 +1714,32 @@ class D6RequestHandler(BaseHTTPRequestHandler):
         return self.server.profile_dir
 
     def end_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:5173")
+        origin = self.headers.get("Origin")
+        if self._origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "DELETE, GET, POST, PUT, OPTIONS")
+        pending_cookie = getattr(self, "pending_cookie", None)
+        if pending_cookie:
+            self.send_header("Set-Cookie", pending_cookie)
+            self.pending_cookie = None
         super().end_headers()
 
     def do_OPTIONS(self) -> None:
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.end_headers()
+        try:
+            self._guard_local_request()
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+        except RequestDenied as exc:
+            json_response(self, {"error": str(exc)}, 403)
 
-    def _body(self) -> bytes:
+    def _body(self, max_size: int = MAX_BODY_SIZE) -> bytes:
         try:
             size = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise ValueError("invalid content length") from exc
-        if size > MAX_BODY_SIZE:
+        if size > max_size:
             raise ValueError("request body is too large")
         return self.rfile.read(size)
 
@@ -923,6 +1752,38 @@ class D6RequestHandler(BaseHTTPRequestHandler):
     def _segments(self) -> list[str]:
         return [unquote(segment) for segment in urlparse(self.path).path.split("/") if segment]
 
+    def _guard_local_request(self) -> None:
+        host = (self.headers.get("Host") or "").split(":", 1)[0].lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise RequestDenied("requests must use the localhost service")
+        origin = self.headers.get("Origin")
+        if origin and not self._origin_allowed(origin):
+            raise RequestDenied("request origin is not allowed")
+
+    @staticmethod
+    def _origin_allowed(origin: str | None) -> bool:
+        if not origin:
+            return False
+        parsed = urlparse(origin)
+        return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+
+    def _session_token(self) -> str | None:
+        from http.cookies import SimpleCookie
+
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = cookie.get(SESSION_COOKIE)
+        return morsel.value if morsel else None
+
+    def _set_session_cookie(self, token: str, *, clear: bool = False) -> None:
+        max_age = 0 if clear else AuthStore.SESSION_TTL
+        value = "" if clear else token
+        self.pending_cookie = f"{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+
+    def _require_auth(self) -> None:
+        self._guard_local_request()
+        if not self.service.auth.session_valid(self._session_token()):
+            raise PermissionError("authentication required")
+
     def do_GET(self) -> None:
         try:
             parsed = urlparse(self.path)
@@ -931,15 +1792,34 @@ class D6RequestHandler(BaseHTTPRequestHandler):
                 self._api_get(segments)
                 return
             self._static_get(parsed.path)
+        except RequestDenied as exc:
+            json_response(self, {"error": str(exc)}, 403)
+        except PermissionError as exc:
+            json_response(self, {"error": str(exc)}, 401)
         except FileNotFoundError:
             json_response(self, {"error": "not found"}, 404)
         except Exception as exc:
             json_response(self, {"error": str(exc)}, 500)
 
     def _api_get(self, segments: list[str]) -> None:
+        self._guard_local_request()
+        if segments == ["api", "auth", "status"]:
+            json_response(self, self.service.auth.status(self._session_token()))
+            return
+        self._require_auth()
         if segments == ["api", "state"]:
             profiles = sorted(path.stem for path in self.profile_dir.glob("*.json"))
             json_response(self, {"device": self.service.device_state(), "profiles": profiles})
+            return
+        if segments == ["api", "backup", "export"]:
+            body = self.service.export_config()
+            filename = f"d6-controller-{time.strftime('%Y-%m-%d')}.d6config"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if segments == ["api", "profiles"]:
             json_response(self, {"profiles": sorted(path.stem for path in self.profile_dir.glob("*.json"))})
@@ -949,6 +1829,9 @@ class D6RequestHandler(BaseHTTPRequestHandler):
             return
         if len(segments) == 10 and segments[:2] == ["api", "profiles"] and segments[-1] == "image":
             self._send_key_image(segments[2], segments[4], segments[6], segments[8])
+            return
+        if len(segments) == 10 and segments[:2] == ["api", "profiles"] and segments[-1] == "preview":
+            self._send_action_preview(segments[2], segments[4], segments[6], segments[8])
             return
         if segments == ["api", "events"]:
             self._send_events()
@@ -967,6 +1850,48 @@ class D6RequestHandler(BaseHTTPRequestHandler):
         body = image_path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", mimetypes.guess_type(image_path.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_action_preview(self, name: str, scene: str, page: str, key: str) -> None:
+        profile = load_profile(name, self.profile_dir)
+        selected, selected_scene, selected_page = resolve_page(profile, scene, page)
+        definition = key_definitions(profile, scene, page).get(str(int(key)), {})
+        action = definition.get("action") if isinstance(definition, dict) else None
+        if not isinstance(action, dict):
+            raise FileNotFoundError
+        pages = page_names(profile, selected_scene)
+        page_index = pages.index(selected_page) if selected_page in pages else 0
+        action_type = str(action.get("type") or "label")
+        label = action_label(action, page_index=page_index, page_total=len(pages))
+        if definition.get("image") and action_type == "open_folder" and action.get("label"):
+            source_path = (self.profile_dir / str(definition["image"])).resolve()
+            if self.profile_dir not in source_path.parents or not source_path.is_file():
+                raise FileNotFoundError
+            image_path = render_labeled_custom_image(
+                source_path,
+                _action_image_path(self.profile_dir, name, selected_scene, selected_page, int(key), {**action, "_custom_image": str(definition["image"])}, page_index=page_index, page_total=len(pages)),
+                label,
+                action_font_size(action),
+                action_type,
+            )
+        elif definition.get("image"):
+            raise FileNotFoundError
+        else:
+            muted = get_microphone_mute() if action_type == "mic_mute" else False
+            mic_artwork = microphone_artwork_path(self.profile_dir, muted) if action_type == "mic_mute" else None
+            image_path = mic_artwork or render_action_image(
+                _action_image_path(self.profile_dir, name, selected_scene, selected_page, int(key), action, page_index=page_index, page_total=len(pages)),
+                label,
+                action_font_size(action),
+                action_type,
+                muted=muted,
+            )
+        body = image_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(image_path.name)[0] or "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1019,6 +1944,7 @@ class D6RequestHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         try:
+            self._require_auth()
             segments = self._segments()
             if len(segments) == 3 and segments[:2] == ["api", "profiles"]:
                 profile = self._json_body()
@@ -1026,6 +1952,10 @@ class D6RequestHandler(BaseHTTPRequestHandler):
                 json_response(self, profile)
                 return
             raise FileNotFoundError
+        except RequestDenied as exc:
+            json_response(self, {"error": str(exc)}, 403)
+        except PermissionError as exc:
+            json_response(self, {"error": str(exc)}, 401)
         except FileNotFoundError:
             json_response(self, {"error": "not found"}, 404)
         except ValueError as exc:
@@ -1036,6 +1966,30 @@ class D6RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             segments = self._segments()
+            if segments in (["api", "auth", "setup"], ["api", "auth", "login"], ["api", "auth", "change-password"], ["api", "auth", "logout"]):
+                self._guard_local_request()
+                data = self._json_body()
+                if segments[-1] == "setup":
+                    token = self.service.auth.setup(str(data.get("password") or ""), str(data.get("confirmation") or ""))
+                    self._set_session_cookie(token)
+                    json_response(self, {"authenticated": True})
+                    return
+                if segments[-1] == "login":
+                    token = self.service.auth.login(str(data.get("password") or ""), self.client_address[0])
+                    self._set_session_cookie(token)
+                    json_response(self, {"authenticated": True})
+                    return
+                if segments[-1] == "logout":
+                    self.service.auth.logout(self._session_token())
+                    self._set_session_cookie("", clear=True)
+                    json_response(self, {"authenticated": False})
+                    return
+                self._require_auth()
+                token = self.service.auth.change_password(self._session_token() or "", str(data.get("password") or ""), str(data.get("confirmation") or ""))
+                self._set_session_cookie(token)
+                json_response(self, {"authenticated": True})
+                return
+            self._require_auth()
             if len(segments) == 4 and segments[:2] == ["api", "profiles"] and segments[3] == "apply":
                 data = self._json_body()
                 profile = load_profile(segments[2], self.profile_dir)
@@ -1056,6 +2010,14 @@ class D6RequestHandler(BaseHTTPRequestHandler):
                 self.service.refresh()
                 json_response(self, {"refreshed": True})
                 return
+            if segments == ["api", "dialog", "folder"]:
+                selected = select_folder_native()
+                json_response(self, {"selected": bool(selected), "path": selected})
+                return
+            if segments == ["api", "backup", "restore"]:
+                restored = self.service.restore_config(self._body(MAX_BACKUP_SIZE))
+                json_response(self, {"profiles": restored})
+                return
             if len(segments) == 4 and segments[:2] == ["api", "profiles"] and segments[3] == "structure":
                 data = self._json_body()
                 profile = load_profile(segments[2], self.profile_dir)
@@ -1067,6 +2029,34 @@ class D6RequestHandler(BaseHTTPRequestHandler):
                 self._upload_key_image(segments[2], segments[4], segments[6], segments[8])
                 return
             raise FileNotFoundError
+        except RequestDenied as exc:
+            json_response(self, {"error": str(exc)}, 403)
+        except PermissionError as exc:
+            json_response(self, {"error": str(exc)}, 401)
+        except AuthError as exc:
+            json_response(self, {"error": str(exc)}, 400)
+        except FileNotFoundError:
+            json_response(self, {"error": "not found"}, 404)
+        except (ValueError, KeyError) as exc:
+            json_response(self, {"error": str(exc)}, 400)
+        except Exception as exc:
+            json_response(self, {"error": str(exc)}, 500)
+
+    def do_DELETE(self) -> None:
+        try:
+            self._require_auth()
+            segments = self._segments()
+            if len(segments) == 10 and segments[:2] == ["api", "profiles"] and segments[-1] == "image":
+                self._delete_key_image(segments[2], segments[4], segments[6], segments[8])
+                return
+            if len(segments) == 9 and segments[:2] == ["api", "profiles"] and segments[7] == "keys":
+                self._delete_key(segments[2], segments[4], segments[6], segments[8])
+                return
+            raise FileNotFoundError
+        except RequestDenied as exc:
+            json_response(self, {"error": str(exc)}, 403)
+        except PermissionError as exc:
+            json_response(self, {"error": str(exc)}, 401)
         except FileNotFoundError:
             json_response(self, {"error": "not found"}, 404)
         except (ValueError, KeyError) as exc:
@@ -1097,6 +2087,49 @@ class D6RequestHandler(BaseHTTPRequestHandler):
         save_profile(name, profile, self.profile_dir)
         json_response(self, {"profile": profile, "image": str(image_path.relative_to(self.profile_dir))})
 
+    def _delete_key_image(self, name: str, scene: str, page: str, key: str) -> None:
+        raw_key = int(key)
+        if not 1 <= raw_key <= 15:
+            raise ValueError("key must be between 1 and 15")
+        profile = load_profile(name, self.profile_dir)
+        selected, _, _ = resolve_page(profile, scene, page)
+        keys = selected.setdefault("keys", {})
+        definition = keys.get(str(raw_key)) if isinstance(keys, dict) else None
+        image_name = definition.get("image") if isinstance(definition, dict) else None
+        if image_name:
+            image_path = (self.profile_dir / image_name).resolve()
+            if self.profile_dir not in image_path.parents:
+                raise ValueError("profile image is outside the profile directory")
+            assets_root = (self.profile_dir / "assets").resolve()
+            if image_path.is_file() and assets_root in image_path.parents:
+                image_path.unlink()
+            definition.pop("image", None)
+            if not definition.get("action"):
+                keys.pop(str(raw_key), None)
+            save_profile(name, profile, self.profile_dir)
+        json_response(self, {"profile": profile})
+
+    def _delete_key(self, name: str, scene: str, page: str, key: str) -> None:
+        raw_key = int(key)
+        if not 1 <= raw_key <= 15:
+            raise ValueError("key must be between 1 and 15")
+        profile = load_profile(name, self.profile_dir)
+        selected, _, _ = resolve_page(profile, scene, page)
+        keys = selected.setdefault("keys", {})
+        if isinstance(keys, dict):
+            definition = keys.get(str(raw_key))
+            image_name = definition.get("image") if isinstance(definition, dict) else None
+            if image_name:
+                image_path = (self.profile_dir / image_name).resolve()
+                if self.profile_dir not in image_path.parents:
+                    raise ValueError("profile image is outside the profile directory")
+                assets_root = (self.profile_dir / "assets").resolve()
+                if image_path.is_file() and assets_root in image_path.parents:
+                    image_path.unlink()
+            keys.pop(str(raw_key), None)
+        save_profile(name, profile, self.profile_dir)
+        json_response(self, {"profile": profile})
+
 
 class D6HTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -1111,13 +2144,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local FIFINE D6 controller service")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--open-browser", action="store_true", help="open the local configurator after the service starts")
     args = parser.parse_args()
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit("For safety, the D6 service only binds to localhost")
+    ensure_default_profile()
     service = D6Service()
     service.start()
     server = D6HTTPServer((args.host, args.port), service)
     print(f"D6 service listening at http://{args.host}:{args.port}")
+    if args.open_browser:
+        threading.Timer(0.75, lambda: webbrowser.open(f"http://{args.host}:{args.port}/")).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

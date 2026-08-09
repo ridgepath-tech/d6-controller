@@ -1,5 +1,6 @@
 # Local Python/runtime output
 .venv/
+.packaging-venv/
 __pycache__/
 *.py[cod]
 *.log
@@ -7,13 +8,38 @@ __pycache__/
 # Frontend dependencies and generated bundle
 node_modules/
 dist/
+packaging/out/
+packaging/work/
+artifacts/
 
 # User-specific controller state and artwork
+data/
 profiles/*.json
 !profiles/.gitkeep
 profiles/assets/*
+!profiles/assets/codex.png
+!profiles/assets/home.png
+!profiles/assets/previous.png
+!profiles/assets/next.png
+!profiles/assets/sleep.png
+!profiles/assets/gas-cloud.png
+!profiles/assets/mic.png
+!profiles/assets/mic-muted.png
 !profiles/assets/.gitkeep
 creds.txt
+*.d6config
+*.sqlite
+*.sqlite3
+*.db
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.token
+.env
+.env.*
+!.env.example
 
 # Investigation and local attachment material
 debug.log
