@@ -44,6 +44,13 @@ All 15 IDs were observed during a physical capture.
 - A per-key image upload was accepted by the device and followed by a refresh.
 - The vendor settings identify the boot-logo canvas as 800x480; that is
   separate from the per-key 100x100 artwork path.
+- The experimental boot-logo path uses a JPEG on an 800x480 white canvas,
+  announces its byte count with a 32-bit big-endian `CRT\0\0LOG` header,
+  streams 512-byte reports, and ends with `CRT\0ULEND`. The logo is persistent
+  and normally becomes visible after the D6 is restarted.
+- The direct controller has not found a reliable read-back command for the
+  factory FIFINE logo. Treat boot-logo replacement as a one-way test until a
+  firmware-specific backup path is discovered.
 
 ## Host-side profiles
 
@@ -64,4 +71,6 @@ the HID transport.
   opening this D6. RGB is therefore reported as unsupported; QUCMD parameter
   semantics remain unconfirmed and the controller does not guess at them.
 
-The controller deliberately does not send firmware-update or flash commands.
+The controller deliberately does not send firmware-update commands. Boot-logo
+replacement is separate from firmware flashing, but it still writes persistent
+device storage and is guarded by an explicit confirmation flag.

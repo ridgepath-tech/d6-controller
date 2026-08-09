@@ -7,6 +7,7 @@ installed FIFINE application.
 
 Image notes:
 * The tested key-image path accepts a 100x100 JPEG.
+* The experimental boot-logo path accepts an 800x480 JPEG.
 * Images are rotated 180 degrees before upload because the panel is mounted
   upside down relative to the host image coordinate system.
 * The device receives each image as 512-byte data chunks.
@@ -35,6 +36,8 @@ REPORT_ID = 0
 REPORT_DATA_SIZE = 512
 REPORT_SIZE = REPORT_DATA_SIZE + 1
 KEY_IMAGE_SIZE = (100, 100)
+BOOT_LOGO_SIZE = (800, 480)
+BOOT_LOGO_JPEG_QUALITY = 95
 HEARTBEAT_PAYLOAD = b"CRT\0\0CONNECT\0\0\0"
 USB_DEVICE_INTERFACE_GUID = "A5DCBF10-6530-11D2-901F-00C04FB951ED"
 # The installed vendor library's lamp-control capability flag is false for
@@ -750,6 +753,30 @@ class D6Controller:
             prepared.save(output, format="JPEG", quality=100, optimize=False)
             return output.getvalue()
 
+    @staticmethod
+    def prepare_boot_logo(image: str | Path) -> bytes:
+        """Prepare an 800x480 JPEG for the experimental persistent logo path."""
+
+        try:
+            from PIL import Image, ImageOps
+        except ImportError as exc:
+            raise D6Error("Pillow is required for boot-logo uploads") from exc
+        with Image.open(image) as source:
+            canvas = Image.new("RGB", BOOT_LOGO_SIZE, "white")
+            fitted = ImageOps.contain(source.convert("RGB"), BOOT_LOGO_SIZE)
+            left = (BOOT_LOGO_SIZE[0] - fitted.width) // 2
+            top = (BOOT_LOGO_SIZE[1] - fitted.height) // 2
+            canvas.paste(fitted, (left, top))
+            output = io.BytesIO()
+            canvas.save(
+                output,
+                format="JPEG",
+                quality=BOOT_LOGO_JPEG_QUALITY,
+                optimize=False,
+                progressive=False,
+            )
+            return output.getvalue()
+
     def set_key_image(self, key: int, image: str | Path | bytes) -> None:
         """Upload a 100x100 JPEG to one key and refresh the panel."""
 
@@ -765,6 +792,36 @@ class D6Controller:
         for offset in range(0, len(jpeg), REPORT_DATA_SIZE):
             self.write_payload(jpeg[offset : offset + REPORT_DATA_SIZE])
         self.refresh()
+
+    def set_boot_logo(
+        self,
+        image: str | Path | bytes,
+        *,
+        confirm_write: bool = False,
+    ) -> None:
+        """Upload a persistent 800x480 boot logo.
+
+        This is intentionally opt-in because the D6 does not expose a tested
+        read-back path for the factory logo.  The caller must explicitly pass
+        ``confirm_write=True``.
+        """
+
+        if not confirm_write:
+            raise D6Error(
+                "Boot-logo writes are persistent; pass confirm_write=True to continue"
+            )
+        jpeg = self.prepare_boot_logo(image) if not isinstance(image, bytes) else image
+        if len(jpeg) > 0xFFFFFFFF:
+            raise D6Error(f"Boot logo is {len(jpeg)} bytes; maximum is 4294967295 bytes")
+        # The vendor's SDDevice::sendLogoSizeCommand uses a 32-bit big-endian
+        # size, followed by a zero flag byte, then streams raw image bytes.
+        self.write_payload(b"CRT\0\0LOG" + struct.pack(">I", len(jpeg)) + b"\0")
+        for offset in range(0, len(jpeg), REPORT_DATA_SIZE):
+            self.write_payload(jpeg[offset : offset + REPORT_DATA_SIZE])
+        # SDDevice::getUploadFinishedCommand queues CRT/ULEND after the final
+        # data report.  STP is deliberately not sent here; boot art is shown
+        # after the next device restart rather than as a live LCD page.
+        self.write_payload(b"CRT\0ULEND")
 
     def clear_key_image(self, key: int) -> None:
         self.write_payload(b"CRT\0\0CLE\0\0\0" + bytes([self.image_device_id(key)]))
@@ -867,6 +924,16 @@ def _cli() -> int:
     image = sub.add_parser("image")
     image.add_argument("key", type=int)
     image.add_argument("path", type=Path)
+    boot_logo = sub.add_parser(
+        "boot-logo",
+        help="upload a persistent 800x480 boot logo (experimental)",
+    )
+    boot_logo.add_argument("path", type=Path)
+    boot_logo.add_argument(
+        "--confirm-write",
+        action="store_true",
+        help="confirm that the factory logo cannot currently be restored by this tool",
+    )
     clear = sub.add_parser("clear-key")
     clear.add_argument("key", type=int)
     scene = sub.add_parser("scene")
@@ -904,6 +971,8 @@ def _cli() -> int:
             controller.send_qucmd(*args.values)
         elif args.command == "image":
             controller.set_key_image(args.key, args.path)
+        elif args.command == "boot-logo":
+            controller.set_boot_logo(args.path, confirm_write=args.confirm_write)
         elif args.command == "clear-key":
             controller.clear_key_image(args.key)
         elif args.command == "scene":

@@ -15,6 +15,7 @@ computer and are ignored by Git.
 - Controls the verified D6 over HID, with compatible WinUSB support available.
 - Sends the vendor-compatible heartbeat and reconnects after device changes.
 - Applies brightness and 100x100 LCD artwork to all fifteen keys.
+- Includes an experimental, explicitly confirmed 800x480 boot-logo uploader.
 - Captures physical press/release events and dispatches configured actions.
 - Provides scenes, pages, navigation, page controls, and a visual key editor.
 - Supports website, folder, app/file, hotkey/text, microphone mute, and deck
@@ -33,6 +34,8 @@ computer and are ignored by Git.
 - It does not include or require a vendor application at runtime. Do not run
   both applications against the same D6 simultaneously.
 - It does not expose firmware-update or flash operations.
+- Boot-logo replacement is persistent and experimental; the current tool cannot
+  back up or restore the factory FIFINE logo.
 - RGB/lamp control is not verified on this D6 and is reported as unsupported.
 - It does not hardcode a desktop app, Codex installation, personal folder, or
   computer-specific shortcut.
@@ -156,6 +159,7 @@ python .\d6_controller.py transport-info
 python .\d6_controller.py brightness 42
 python .\d6_controller.py heartbeat
 python .\d6_controller.py image 1 .\my-key-art.jpg
+python .\d6_controller.py boot-logo .\my-logo.png --confirm-write
 python .\d6_controller.py clear-key 1
 python .\d6_controller.py scene .\profile.example.json --scene default --page main
 python .\d6_controller.py listen --seconds 30
@@ -165,6 +169,13 @@ The image command resizes/crops to 100x100, rotates the image 180 degrees,
 and uploads it as JPEG data. `D6_TRANSPORT=hid` forces HID; `winusb` requires a
 WinUSB binding; `auto` tries WinUSB and falls back to HID. The default is
 `auto`.
+
+The boot-logo command fits an image to an 800x480 white canvas and uploads it
+to persistent device storage. The explicit flag is required because the
+factory logo cannot currently be read back by this project. Restart the D6 to
+observe the result, and do not run the command while the FIFINE Control Deck is
+using the device. Boot-logo upload is intentionally separate from profile
+application.
 
 ## Development
 
