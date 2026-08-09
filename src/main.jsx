@@ -7,7 +7,7 @@ const KEY_LAYOUT = [11, 12, 13, 14, 15, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5];
 const BUILTIN_ACTION_LABELS = { back: "Back", home: "Home", previous_page: "Prev", next_page: "Next", page_indicator: "Page", sleep: "Sleep", mic_mute: "Mic" };
 const BUILTIN_ACTION_TYPES = new Set(Object.keys(BUILTIN_ACTION_LABELS));
 const ACTION_TYPES_WITH_ART = new Set([...BUILTIN_ACTION_TYPES, "navigate", "website", "launch", "open_folder", "hotkey"]);
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 function Icon({ name, size = 18 }) {
   const paths = {

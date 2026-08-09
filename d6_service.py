@@ -12,10 +12,12 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tempfile
 import uuid
+import webbrowser
 import zipfile
 import io
 from collections import deque
@@ -30,11 +32,20 @@ from d6_controller import D6Controller, D6Error
 from d6_auth import AuthError, AuthStore
 
 
-BASE_DIR = Path(__file__).resolve().parent
+def _application_dir() -> Path:
+    """Return the source directory or installed executable directory."""
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = _application_dir()
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR)).resolve()
 PROFILE_DIR = Path(os.environ.get("D6_PROFILE_DIR", str(BASE_DIR / "profiles"))).resolve()
 DATA_DIR = Path(os.environ.get("D6_DATA_DIR", str(BASE_DIR / "data"))).resolve()
 AUTH_PATH = DATA_DIR / "auth.json"
-FRONTEND_DIR = BASE_DIR / "dist"
+FRONTEND_DIR = RESOURCE_DIR / "dist"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 STRUCTURE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9 ._-]*[A-Za-z0-9])?$")
 MAX_BODY_SIZE = 12 * 1024 * 1024
@@ -994,6 +1005,23 @@ def save_profile(name: str, profile: dict[str, Any], profile_dir: Path = PROFILE
     temporary = target.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(normalize_profile(profile), indent=2) + "\n", encoding="utf-8")
     temporary.replace(target)
+
+
+def ensure_default_profile(profile_dir: Path = PROFILE_DIR) -> None:
+    """Create the first local profile from the public template if needed."""
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    template = RESOURCE_DIR / "profile.example.json"
+    if not any(profile_dir.glob("*.json")) and template.is_file():
+        shutil.copyfile(template, profile_dir / "default.json")
+
+    bundled_assets = RESOURCE_DIR / "profiles" / "assets"
+    user_assets = profile_dir / "assets"
+    if bundled_assets.is_dir() and bundled_assets.resolve() != user_assets.resolve():
+        user_assets.mkdir(parents=True, exist_ok=True)
+        for asset in bundled_assets.iterdir():
+            if asset.is_file() and not (user_assets / asset.name).exists():
+                shutil.copyfile(asset, user_assets / asset.name)
 
 
 def scene_names(profile: dict[str, Any]) -> list[str]:
@@ -2116,13 +2144,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local FIFINE D6 controller service")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--open-browser", action="store_true", help="open the local configurator after the service starts")
     args = parser.parse_args()
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit("For safety, the D6 service only binds to localhost")
+    ensure_default_profile()
     service = D6Service()
     service.start()
     server = D6HTTPServer((args.host, args.port), service)
     print(f"D6 service listening at http://{args.host}:{args.port}")
+    if args.open_browser:
+        threading.Timer(0.75, lambda: webbrowser.open(f"http://{args.host}:{args.port}/")).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -15,6 +15,7 @@ from d6_service import (
     action_label,
     action_font_size,
     add_structure,
+    ensure_default_profile,
     focus_explorer_path,
     key_definitions,
     load_profile,
@@ -31,6 +32,13 @@ from d6_service import (
 
 
 class D6ServiceHelpersTests(unittest.TestCase):
+    def test_first_service_start_copies_the_public_profile_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_dir = Path(temporary) / "profiles"
+            ensure_default_profile(profile_dir)
+            self.assertTrue((profile_dir / "default.json").is_file())
+            self.assertIn('"scenes"', (profile_dir / "default.json").read_text(encoding="utf-8"))
+
     def test_auth_store_hashes_password_and_rotates_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = AuthStore(Path(temporary) / "auth.json")

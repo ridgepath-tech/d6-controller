@@ -28,6 +28,9 @@ FIFINE AmpliGame D6
   sessions. It never belongs in a profile backup.
 - `src/main.jsx` and `src/styles.css` are the browser configurator. The built
   files in `dist/` are generated and ignored.
+- `packaging/build-installer.ps1` uses PyInstaller to make a standalone
+  service bundle; `installer/D6Controller.iss` turns that bundle into the
+  per-user Windows installer.
 - `profiles/` is the user-owned configuration boundary. The example profile
   and bundled artwork are public; a real `profiles/default.json` is not.
 

@@ -1,0 +1,55 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Installer version"
+        required: true
+        default: "0.3.0"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: powershell
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if ($env:GITHUB_REF_NAME.StartsWith('v')) {
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+          } elseif ($env:DISPATCH_VERSION) {
+            $version = $env:DISPATCH_VERSION
+          } else {
+            $version = '0.3.0'
+          }
+          .\packaging\build-installer.ps1 -Version $version
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: D6ControllerSetup
+          path: artifacts/D6ControllerSetup.exe
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" artifacts/D6ControllerSetup.exe --repo "$env:GITHUB_REPOSITORY" --generate-notes --title "D6 Controller $env:GITHUB_REF_NAME"

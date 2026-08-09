@@ -71,6 +71,19 @@ D6. Hardware commands require Windows and the device.
 
 ## Install for normal use
 
+For the simplest experience, download `D6ControllerSetup.exe` from the
+project's GitHub Releases page and run it. The installer includes the Python
+runtime dependencies, service executable, frontend, public template, and
+bundled artwork; users do not need Python, Node.js, or a separate vendor
+application. It installs per-user, registers launch at logon, preserves local
+profiles during upgrades, and opens the configurator after installation.
+
+The installer is built for Windows x64. The D6 must still be connected to the
+computer, and Windows may need to finish installing its normal HID device
+driver.
+
+If a release installer is not available, use the developer setup below.
+
 Open PowerShell in the repository folder:
 
 ```powershell
@@ -164,6 +177,17 @@ python -m unittest discover -v
 npm run build
 git diff --check
 ```
+
+To build the standalone bundle and installer locally, install Inno Setup 6 and
+run:
+
+```powershell
+.\packaging\build-installer.ps1 -Version 0.3.0
+```
+
+The standalone bundle is written under `packaging/out/` and the installer is
+written under `artifacts/`; both locations are ignored. GitHub Actions builds
+the same installer on demand or when a `v*` tag is pushed.
 
 The public-release check scans tracked and non-ignored files for local-only
 paths and common credential formats without printing matching content. CI runs

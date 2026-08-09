@@ -29,6 +29,10 @@ npm run build
 git diff --check
 ```
 
+To exercise the distributable build, install Inno Setup 6 and run
+`.\packaging\build-installer.ps1 -Version 0.3.0`. The generated bundle and
+installer are ignored build output and must not be committed.
+
 If you have a D6 attached, verify hardware changes manually after the mocked
 tests pass. Do not run the vendor Control Deck and this service against the
 same D6 at the same time.
