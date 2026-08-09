@@ -56,6 +56,69 @@ class D6ServiceHelpersTests(unittest.TestCase):
             service.refresh()
             self.assertTrue(controller.refreshed)
 
+    def test_power_state_sleeps_and_restores_the_d6(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def sleep_screen(self) -> None:
+                self.calls.append("sleep")
+
+            def wake_screen(self) -> None:
+                self.calls.append("wake")
+
+            def heartbeat(self) -> None:
+                self.calls.append("heartbeat")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_dir = Path(temporary) / "profiles"
+            profile = {"scenes": {"default": {"pages": {"main": {"keys": {}}}}}}
+            save_profile("default", profile, profile_dir)
+            service = D6Service(profile_dir, Path(temporary) / "data")
+            controller = FakeController()
+            service.controller = controller
+
+            with patch.object(service, "_active_context", return_value=("default", "default", "main")), patch.object(service, "apply", return_value=0) as apply:
+                service._handle_system_suspend()
+                service._handle_system_resume()
+                service._handle_system_resume()
+
+            self.assertEqual(controller.calls, ["sleep", "wake", "heartbeat"])
+            apply.assert_called_once_with(profile, "default", "main", profile_name="default")
+            self.assertFalse(service.restful_reasons)
+            self.assertEqual(service.recent_events[-1]["state"], "awake")
+
+    def test_display_and_system_power_reasons_do_not_wake_early(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.sleep_count = 0
+                self.wake_count = 0
+
+            def sleep_screen(self) -> None:
+                self.sleep_count += 1
+
+            def wake_screen(self) -> None:
+                self.wake_count += 1
+
+            def heartbeat(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            profile_dir = Path(temporary) / "profiles"
+            save_profile("default", {"scenes": {"default": {"pages": {"main": {"keys": {}}}}}}, profile_dir)
+            service = D6Service(profile_dir, Path(temporary) / "data")
+            controller = FakeController()
+            service.controller = controller
+            with patch.object(service, "_active_context", return_value=("default", "default", "main")), patch.object(service, "apply", return_value=0):
+                service._handle_display_off()
+                service._handle_system_suspend()
+                service._handle_system_resume()
+                self.assertEqual(controller.wake_count, 0)
+                service._handle_display_on()
+
+            self.assertEqual(controller.sleep_count, 1)
+            self.assertEqual(controller.wake_count, 1)
+
     def test_action_font_size_is_clamped(self) -> None:
         self.assertEqual(action_font_size({"font_size": 12}), 12)
         self.assertEqual(action_font_size({"font_size": 3}), 8)

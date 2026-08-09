@@ -28,6 +28,11 @@ Never commit `profiles/*.json`, `profiles/assets/*`, `data/auth.json`, local
 credential files, logs, or exported `.d6config` files. The repository's
 `.gitignore` excludes these paths.
 
+Before creating a commit or pull request, run
+`python scripts/public_release_check.py`. It checks the tracked and
+non-ignored working-tree surface for common credential formats and
+computer-specific paths without printing matching values.
+
 Before exposing the service beyond localhost, perform a separate threat-model
 review and add explicit authorization boundaries for any remote users. This
 project is designed for one local Windows user.

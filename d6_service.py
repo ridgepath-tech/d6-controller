@@ -130,6 +130,153 @@ def _guid(value: str) -> _GUID:
     return _GUID(parsed.time_low, parsed.time_mid, parsed.time_hi_version, (ctypes.c_ubyte * 8)(*parsed.bytes[8:]))
 
 
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HCURSOR),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class _POWERBROADCAST_SETTING(ctypes.Structure):
+    _fields_ = [
+        ("PowerSetting", _GUID),
+        ("DataLength", wintypes.DWORD),
+        ("Data", ctypes.c_ubyte * 1),
+    ]
+
+
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND = 0x0004
+PBT_APMRESUMEAUTOMATIC = 0x0012
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_POWERSETTINGCHANGE = 0x8013
+DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+GUID_CONSOLE_DISPLAY_STATE = _guid("6FE69556-704A-47A0-8F24-C28D936FDA47")
+
+
+class _WindowsPowerMonitor:
+    """Receive Windows suspend/resume and console-display power changes."""
+
+    def __init__(self, on_suspend, on_resume, on_display_off, on_display_on):
+        self.on_suspend = on_suspend
+        self.on_resume = on_resume
+        self.on_display_off = on_display_off
+        self.on_display_on = on_display_on
+        self.stop_event = threading.Event()
+        self.ready_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.hwnd = None
+        self._wndproc = None
+        self._class_name: str | None = None
+        self._power_notification = None
+
+    def start(self) -> None:
+        if os.name != "nt":
+            return
+        self.thread = threading.Thread(target=self._run, name="d6-power-monitor", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.hwnd:
+            try:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+                user32.PostMessageW.restype = wintypes.BOOL
+                user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+            except OSError:
+                pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        wndproc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        class_name = f"RidgePathD6Power-{os.getpid()}-{id(self)}"
+        self._class_name = class_name
+
+        def wndproc(hwnd, message, wparam, lparam):
+            if message == WM_POWERBROADCAST:
+                if wparam == PBT_APMSUSPEND:
+                    self.on_suspend()
+                elif wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                    self.on_resume()
+                elif wparam == PBT_POWERSETTINGCHANGE and lparam:
+                    setting = ctypes.cast(lparam, ctypes.POINTER(_POWERBROADCAST_SETTING)).contents
+                    if bytes(setting.PowerSetting.Data4) == bytes(GUID_CONSOLE_DISPLAY_STATE.Data4) and setting.PowerSetting.Data1 == GUID_CONSOLE_DISPLAY_STATE.Data1 and setting.PowerSetting.Data2 == GUID_CONSOLE_DISPLAY_STATE.Data2 and setting.PowerSetting.Data3 == GUID_CONSOLE_DISPLAY_STATE.Data3:
+                        if setting.DataLength and setting.Data[0] == 0:
+                            self.on_display_off()
+                        elif setting.DataLength and setting.Data[0] in (1, 2):
+                            self.on_display_on()
+                return 1
+            if message == WM_CLOSE:
+                user32.DestroyWindow(hwnd)
+                return 0
+            if message == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+        self._wndproc = wndproc_type(wndproc)
+        instance = kernel32.GetModuleHandleW(None)
+        window_class = _WNDCLASSW()
+        window_class.lpfnWndProc = ctypes.cast(self._wndproc, ctypes.c_void_p)
+        window_class.hInstance = instance
+        window_class.lpszClassName = class_name
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.RegisterPowerSettingNotification.argtypes = [wintypes.HWND, ctypes.POINTER(_GUID), wintypes.DWORD]
+        user32.RegisterPowerSettingNotification.restype = wintypes.HANDLE
+        user32.UnregisterPowerSettingNotification.argtypes = [wintypes.HANDLE]
+        user32.UnregisterPowerSettingNotification.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+
+        if not user32.RegisterClassW(ctypes.byref(window_class)):
+            self.ready_event.set()
+            return
+        try:
+            self.hwnd = user32.CreateWindowExW(0, class_name, "RidgePath D6 Power Monitor", 0, 0, 0, 0, 0, None, None, instance, None)
+            if not self.hwnd:
+                return
+            self._power_notification = user32.RegisterPowerSettingNotification(self.hwnd, ctypes.byref(GUID_CONSOLE_DISPLAY_STATE), DEVICE_NOTIFY_WINDOW_HANDLE)
+            self.ready_event.set()
+            message = wintypes.MSG()
+            while not self.stop_event.is_set():
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        finally:
+            if self._power_notification:
+                user32.UnregisterPowerSettingNotification(self._power_notification)
+            if self.hwnd:
+                user32.DestroyWindow(self.hwnd)
+                self.hwnd = None
+            user32.UnregisterClassW(class_name, instance)
+
+
 CLSID_MMDEVICE_ENUMERATOR = _guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
 IID_IMMDEVICE_ENUMERATOR = _guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
 IID_IAUDIO_ENDPOINT_VOLUME = _guid("5CDF2C82-841E-4546-9722-0CF74078229A")
@@ -922,6 +1069,12 @@ class D6Service:
         self.stop_event = threading.Event()
         self.listener_thread: threading.Thread | None = None
         self.heartbeat_thread: threading.Thread | None = None
+        self.power_monitor = _WindowsPowerMonitor(
+            self._handle_system_suspend,
+            self._handle_system_resume,
+            self._handle_display_off,
+            self._handle_display_on,
+        )
         self.subscribers: set[queue.Queue[dict[str, Any]]] = set()
         self.subscribers_lock = threading.Lock()
         self.recent_events: deque[dict[str, Any]] = deque(maxlen=100)
@@ -937,6 +1090,8 @@ class D6Service:
         self.ignored_report_count = 0
         self.last_report_hex: str | None = None
         self.transport = os.environ.get("D6_TRANSPORT", "auto").strip().lower()
+        self.power_state_lock = threading.RLock()
+        self.restful_reasons: set[str] = set()
 
     def start(self) -> None:
         self.stop_event.clear()
@@ -944,9 +1099,11 @@ class D6Service:
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self.listener_thread.start()
         self.heartbeat_thread.start()
+        self.power_monitor.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.power_monitor.stop()
         with self.controller_lock:
             controller, self.controller = self.controller, None
         if controller:
@@ -979,6 +1136,9 @@ class D6Service:
         return self.controller
 
     def _current_controller(self) -> D6Controller | None:
+        with self.power_state_lock:
+            if self.restful_reasons:
+                return None
         with self.controller_lock:
             controller = self.controller
         return controller or self._connect()
@@ -989,8 +1149,69 @@ class D6Service:
                 self.controller = None
         controller.close()
 
+    def _handle_system_suspend(self) -> None:
+        self._enter_restful_state("system")
+
+    def _handle_system_resume(self) -> None:
+        self._leave_restful_state("system")
+
+    def _handle_display_off(self) -> None:
+        self._enter_restful_state("display")
+
+    def _handle_display_on(self) -> None:
+        self._leave_restful_state("display")
+
+    def _enter_restful_state(self, reason: str) -> None:
+        with self.power_state_lock:
+            if reason in self.restful_reasons:
+                return
+            was_active = not self.restful_reasons
+            self.restful_reasons.add(reason)
+        if not was_active:
+            return
+        with self.controller_lock:
+            controller = self.controller
+        if controller is not None:
+            try:
+                with self.operation_lock:
+                    controller.sleep_screen()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self._disconnect(controller)
+        self.publish_event({"type": "power", "state": "resting", "reason": reason, "timestamp": time.time()})
+
+    def _leave_restful_state(self, reason: str) -> None:
+        with self.power_state_lock:
+            if reason not in self.restful_reasons:
+                return
+            self.restful_reasons.discard(reason)
+            still_resting = bool(self.restful_reasons)
+        if still_resting:
+            return
+        controller = self._current_controller()
+        if controller is None:
+            self.publish_event({"type": "power", "state": "awake", "reason": reason, "timestamp": time.time()})
+            return
+        try:
+            with self.operation_lock:
+                controller.wake_screen()
+                controller.heartbeat()
+            profile_name, scene, page = self._active_context()
+            profile = load_profile(profile_name, self.profile_dir)
+            self.apply(profile, scene, page, profile_name=profile_name)
+            self.publish_event({"type": "power", "state": "awake", "reason": reason, "timestamp": time.time()})
+        except Exception as exc:
+            self.last_error = str(exc)
+            self._disconnect(controller)
+            self.publish_event({"type": "error", "message": f"D6 resume failed: {exc}", "timestamp": time.time()})
+
     def _listener_loop(self) -> None:
         while not self.stop_event.is_set():
+            with self.power_state_lock:
+                resting = bool(self.restful_reasons)
+            if resting:
+                self.stop_event.wait(0.5)
+                continue
             controller = self._current_controller()
             if controller is None:
                 self.stop_event.wait(1)
@@ -1071,6 +1292,11 @@ class D6Service:
             "transport": transport,
             "transport_note": transport_note,
             "last_error": self.last_error,
+            "power": {
+                "resting": bool(self.restful_reasons),
+                "reasons": sorted(self.restful_reasons),
+                "sync_enabled": os.name == "nt",
+            },
             "input": {
                 "reports": self.report_count,
                 "decoded_events": self.decoded_event_count,
